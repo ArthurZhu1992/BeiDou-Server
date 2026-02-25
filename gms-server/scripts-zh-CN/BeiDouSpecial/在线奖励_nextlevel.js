@@ -79,7 +79,7 @@ var config = {
 /**
  * 全局变量
  * - 累计在线分钟数
- * @type {number}
+ * @type {number
  */
 var g_OnlineMinutes = 0;
 /**

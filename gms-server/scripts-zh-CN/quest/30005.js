@@ -80,7 +80,8 @@ function end(mode, type, selection)
 	    if (status == 0)
 	    {
 			//第一层对话
-            qm.sendOk("天呐您这么快就消灭了200只，冒险岛世界有救了！谢谢您~！");		
+            qm.sendOk("天呐您这么快就消灭了200只，冒险岛世界有救了！谢谢您~！\r\n\r\n#b[神性启示]#k 你的『暗影回路』已被净化，魔力经脉在体内重新轰鸣。\r\n最大MP +50！");		
+            qm.getPlayer().addMaxMP(50);
 			qm.forceCompleteQuest();
 	    }
 		else

@@ -225,6 +225,9 @@ public final class PlayerLoggedinHandler extends AbstractPacketHandler {
                 player.newClient(c);
             }
 
+            // 登录时从 DB 恢复今日在线时长
+            player.initOnlineTimeForToday();
+
             // 增加参数判断，避免给客户端发未知包导致异常
             if (GameConfig.getServerBoolean("use_server_auto_pot")) {
                 byte hpAlert = hpMpAlertService.getHpAlert(player.getId());

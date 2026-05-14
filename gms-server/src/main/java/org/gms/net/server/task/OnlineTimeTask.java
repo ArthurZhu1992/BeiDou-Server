@@ -1,59 +1,22 @@
 package org.gms.net.server.task;
 
 import org.gms.client.Character;
-import org.gms.constants.string.ExtendKey;
 import org.gms.net.server.Server;
 import org.gms.net.server.channel.Channel;
 
-import java.time.LocalDate;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
-
+// 在线时长定时任务
+// 每5秒遍历全服所有在线角色, 调用 tickOnlineTime() 递增在线时长
+// 该任务只做"转发", 跨日归零和上限钳制由 Character 内部处理
 public class OnlineTimeTask implements Runnable {
-    private final AtomicReference<LocalDate> lastUpdated = new AtomicReference<>(LocalDate.now());
-    private final AtomicBoolean running = new AtomicBoolean(false);
-
     @Override
     public void run() {
-        if (!Server.getInstance().isOnline()) {
-            return;
-        }
-        if (!running.compareAndSet(false, true)) {
-            return;
-        }
-        LocalDate now = LocalDate.now();
-        boolean isNextDay = now.isAfter(lastUpdated.get());
-        for (final Channel chan : Server.getInstance().getAllChannels()) {
-            if (chan == null || chan.getPlayerStorage() == null) {
-                continue;
+        if (!Server.getInstance().isOnline()) return;
+        for (Channel chan : Server.getInstance().getAllChannels()) {
+            if (chan == null || chan.getPlayerStorage() == null) continue;
+            for (Character chr : chan.getPlayerStorage().getAllCharacters()) {
+                if (chr == null) continue;
+                chr.tickOnlineTime();
             }
-            for (final Character chr : chan.getPlayerStorage().getAllCharacters()) {
-                if (chr == null) {
-                    continue;
-                }
-                int onlineTime = chr.getCurrentOnlineTime();
-                if (onlineTime == -1) {
-                    // 避免异常导致running恒为true
-                    onlineTime = getInitialOnlineTime(chr);
-                } else {
-                    onlineTime += 5;
-                }
-                if (isNextDay || onlineTime < 0) {
-                    onlineTime = 0;
-                }
-                chr.setCurrentOnlineTime(onlineTime);
-            }
-        }
-        running.set(false);
-        lastUpdated.set(now);
-    }
-
-    private int getInitialOnlineTime(Character chr) {
-        try {
-            String timeStr = chr.getAbstractPlayerInteraction().getAccountExtendValue(ExtendKey.ONLINE_TIME.getKey(), true);
-            return timeStr == null ? 0 : Integer.parseInt(timeStr);
-        } catch (Exception e) {
-            return 0;
         }
     }
 }

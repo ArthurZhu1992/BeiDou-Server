@@ -19,7 +19,6 @@
         <a-input
           v-model="userInfo.username"
           :placeholder="$t('form.login.user.placeholder')"
-          @keydown.enter="focusToPassword"
         >
           <template #prefix>
             <icon-user />
@@ -36,7 +35,6 @@
           v-model="userInfo.password"
           :placeholder="$t('form.login.password.placeholder')"
           allow-clear
-          @keydown.enter="handleSubmit"
         >
           <template #prefix>
             <icon-lock />
@@ -68,7 +66,7 @@
 </template>
 
 <script lang="ts" setup>
-import {ref, reactive, nextTick} from 'vue';
+  import { ref, reactive } from 'vue';
   import { useRouter } from 'vue-router';
   import { Message } from '@arco-design/web-vue';
   import { ValidatedError } from '@arco-design/web-vue/es/form/interface';
@@ -93,18 +91,6 @@ import {ref, reactive, nextTick} from 'vue';
     username: loginConfig.value.username,
     password: loginConfig.value.password,
   });
-
-  // 添加对密码输入框的引用
-  const passwordInputRef = ref();
-
-  // 跳转到密码输入框
-  const focusToPassword = () => {
-    nextTick(() => {
-      if (passwordInputRef.value) {
-        passwordInputRef.value.focus();
-      }
-    });
-  };
 
   const handleSubmit = async ({
     errors,

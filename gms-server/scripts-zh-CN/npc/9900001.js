@@ -23,97 +23,55 @@ function action(mode, type, selection) {
         status--;
     }
 
-    if (status === 0) {
-		let text = OldTitle;
-        text += "当前点券：" + cm.getPlayer().getCashShop().getCash(1) + "\r\n";
-        text += "当前抵用券：" + cm.getPlayer().getCashShop().getCash(2) + "\r\n";
-        text += "当前信用券：" + cm.getPlayer().getCashShop().getCash(4) + "\r\n";
-		text += "当前金币：" + cm.getPlayer().getMeso() + "\r\n";
-        text += " \r\n\r\n";
-		text += "#L3#传送自由#l \t #L69#快速转职#l \t #L70#学习技能#l\r\n";
-		text += "#L71#超级传送#l \t #L4#爆率一览#l \t #L2#在线奖励#l\r\n";
-        text += "#L0#新人福利#l \t #L1#每日签到#l  \t #L72#转世重生#l\r\n";
-		text += "#L999#测试脚本>>>未上线#l \t \r\n";
-        if (cm.getPlayer().isGM()) {
-            text += "\r\n\r\n";
-            text += "\t\t\t\t#r=====以下内容仅GM可见=====\r\n";
-            text += "#L61#超级传送#l \t #L62#超级商店#l \t #L63#整容集合#l\r\n\r\n";
-			text += "#L64#UI查询#l \t #L65#一键删除道具#l \t #L66#一键刷道具#l\r\n\r\n";
-			text += "#L67#有状态脚本示例#l \t #L68#NextLevel脚本示例#l";
+    if (status == 0) {
+        var p = cm.getPlayer();
+        var nx = formatValue(p.getCashShop().getCash(1));
+        var dy = formatValue(p.getCashShop().getCash(2));
+        var meso = formatValue(p.getMeso());
+
+        var selStr = "\r\n\t\t #e#r" + icon + " BeiDou 脚本中心 " + icon + "#n#k\r\n";
+        selStr += "#d━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━#k\r\n";
+
+        // 资产信息区域
+        selStr += " #b点券:#k #r" + nx + "#k #b抵用:#k #r" + dy + "#k #b金币:#k #r" + meso + "#k\r\n";
+
+        selStr += "\r\n#d━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━#k\r\n";
+
+        // 主要功能区 (三列布局)
+        selStr += "#L0# #b新人福利#k#l #L1# #b每日签到#k#l #L2# #b在线奖励#k#l\r\n";
+        selStr += "#L3# #b传送中心#k#l #L4# #b爆率查询#k#l #L5# #b任务排行#k#l\r\n";
+
+        // 70级专属进阶区
+        if (p.getLevel() >= 70) {
+            selStr += "\r\n#d━━━━━━━━━━━#k#e#r[ 进阶功能区 (Lv.70+) ]#k#n#d━━━━━━━━━━━#k\r\n";
+            selStr += "#L6# #r清理背包#k#l\r\n";
+        }
+
+        // GM功能区（隐藏）
+        if (p.isGM()) {
+            selStr += "\r\n#d━━━━━━━━━━━━━━━━━#k#e#r[ GM 后台 ]#k#n#d━━━━━━━━━━━━━━━━━#k\r\n";
+            selStr += "#L61#超级传送#l #L62#超级商店#l #L63#整容集合#l\r\n";
+        }
+
+        cm.sendSimple(selStr);
+
+    } else if (status == 1) {
+        switch (selection) {
+            case 0: cm.dispose(); cm.openNpc(9900001, "新人福利"); break;
+            case 1: cm.dispose(); cm.openNpc(9900001, "每日签到"); break;
+            case 2: cm.dispose(); cm.openNpc(9900001, "在线奖励_nextlevel"); break;
+            case 3:
+                cm.dispose();
+                cm.getPlayer().saveLocation("FREE_MARKET");
+                cm.warp(910000000, "out00");
+                break;
+            case 4: cm.dispose(); cm.openNpc(9900001, "当前地图掉落"); break;
+            case 5: cm.dispose(); cm.openNpc(9900001, "任务排行"); break;
+            case 6: cm.dispose(); cm.openNpc(9900001, "一键删除道具small"); break;
+            case 61: cm.dispose(); cm.openNpc(9900001, "万能传送"); break;
+            case 62: cm.dispose(); cm.openShopNPC(9900001); break;
+            case 63: cm.dispose(); cm.openNpc(9900001, "Salon"); break;
+            default: cm.dispose();
         }
     }
-}
-
-function doSelect(selection) {
-    switch (selection) {
-        // 非GM功能
-		case 999:
-            openNpc("测试脚本");
-            break;
-        case 69:
-            openNpc("快速转职");
-            break;
-        case 70:
-            openNpc("技能学习");
-            break;
-        case 71:
-            openNpc("万能传送");
-            break;
-        case 72:
-            openNpc("转世重生");
-            break;
-        case 0:
-            openNpc("新人福利");
-            break;
-        case 1:
-            openNpc("每日签到");
-            break;
-        case 2:
-            openNpc("在线奖励_nextlevel");
-            break;
-        case 3:
-            cm.getPlayer().saveLocation("FREE_MARKET");
-            cm.warp(910000000, "out00");
-            break;
-        case 4:
-            openNpc("当前地图掉落");
-            break;
-        // GM功能
-        case 61:
-            openNpc("万能传送");
-            break;
-        case 62:
-            cm.dispose();
-            cm.openShopNPC(9900001);
-            cm.dispose();
-            break;
-        case 63:
-            openNpc("Salon");
-            break;
-        case 64:
-            openNpc("UI查询");
-            break;	
-        case 65:
-            openNpc("一键删除道具");
-            break;
-        case 66:
-            openNpc("一键刷道具");
-            break;
-        case 67:
-            openNpc("Example1")
-            break;
-        case 68:
-            openNpc("Example2")
-            break;
-
-
-        default:
-            cm.sendOk("该功能暂不支持，敬请期待！");
-            cm.dispose();
-    }
-}
-
-function openNpc(scriptName) {
-    cm.dispose();
-    cm.openNpc(9900001, scriptName);
 }

@@ -43,7 +43,6 @@ import org.gms.constants.id.MobId;
 import org.gms.constants.inventory.ItemConstants;
 import org.gms.constants.net.ServerConstants;
 import org.gms.constants.skills.*;
-import org.gms.constants.string.ExtendKey;
 import org.gms.constants.string.ExtendType;
 import org.gms.dao.entity.*;
 import org.gms.exception.NotEnabledException;
@@ -99,7 +98,6 @@ import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.time.LocalDate;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -9905,69 +9903,124 @@ public class Character extends AbstractCharacterObject {
     }
 
     /////////////////////////////////////////////////////////////////////////////////
-    // 角色在线时长
-    // 设计要点:
-    //   - m_iCurrentOnlineTime 是直接字段,由定时任务每5s递增,不依赖DB实时计算
-    //   - Character 对象在换频道/进商城等会话迁移时仍驻留 World 内存,
-    //     字段值不丢失,因此迁移前无需调 updateOnlineTime 写库
-    //   - 登录时 initOnlineTimeForToday() 从 DB 恢复今日已有时长
-    //   - 跨日归零在 tickOnlineTime 中检测日期变化完成
-    //   - 退出时 updateOnlineTime() 将内存值写入 extend_value 表持久化
-    /////////////////////////////////////////////////////////////////////////////////
-    // 每日在线时长上限: 86400秒(24小时)
-    private static final int MAX_DAILY_ONLINE_TIME_SECONDS = 24 * 60 * 60;
-    // 定时任务递增步长: 每5秒 +1
+    //module: 角色在线时间
+    private static final String DAILY_ONLINE_TIME_EXTEND_NAME = "每日在线时间";
     private static final int ONLINE_TIME_TICK_SECONDS = 5;
+    private static final int MAX_DAILY_ONLINE_TIME_SECONDS = 24 * 60 * 60;
 
-    // 当前在线时长(秒), 0 = 新的一天尚未产生时长
-    private int m_iCurrentOnlineTime = 0;
-    // 当前在线时长所属日期, 用于跨日归零判断
+    private int m_iCurrentOnlineTime = -1;//-1用于服务器重启时角色初始变量时间
     private LocalDate m_dCurrentOnlineDate;
 
-    // 获取当前在线时长(秒)
     public synchronized int getCurrentOnlineTime() {
-        return m_iCurrentOnlineTime;
+        return Math.max(this.m_iCurrentOnlineTime, 0);
     }
 
-    // 设置当前在线时长(秒), 自动钳制到 [0, MAX_DAILY_ONLINE_TIME_SECONDS]
     public synchronized void setCurrentOnlineTime(final int iTime) {
-        m_iCurrentOnlineTime = Math.max(0, Math.min(iTime, MAX_DAILY_ONLINE_TIME_SECONDS));
+        applyOnlineTimeState(LocalDate.now(), iTime);
     }
 
-    // 登录时从 DB 恢复今日在线时长, 记录当前日期
+    /**
+     * 登录后同步初始化今日在线时长，避免首次定时任务执行前仍保留 -1 或上一天的值。
+     */
     public synchronized void initOnlineTimeForToday() {
-        m_iCurrentOnlineTime = loadOnlineTimeFromDB();
-        m_dCurrentOnlineDate = LocalDate.now();
+        LocalDate today = LocalDate.now();
+        applyOnlineTimeState(today, loadOnlineTimeForDate(today));
     }
 
-    // 定时任务每5s调用一次: 跨日归零, 未达上限则 +5s
+    /**
+     * 定时任务统一从这里推进在线时长，跨天时只做归零，不再把昨天的值继续累加到今天。
+     */
     public synchronized void tickOnlineTime() {
         LocalDate today = LocalDate.now();
-        if (!today.equals(m_dCurrentOnlineDate)) {
-            m_iCurrentOnlineTime = 0;
-            m_dCurrentOnlineDate = today;
+        if (!isOnlineTimeInitialized()) {
+            applyOnlineTimeState(today, loadOnlineTimeForDate(today));
             return;
         }
-        if (m_iCurrentOnlineTime >= MAX_DAILY_ONLINE_TIME_SECONDS) return;
-        m_iCurrentOnlineTime += ONLINE_TIME_TICK_SECONDS;
+        if (!today.equals(m_dCurrentOnlineDate)) {
+            applyOnlineTimeState(today, 0);
+            return;
+        }
+        applyOnlineTimeState(today, m_iCurrentOnlineTime + ONLINE_TIME_TICK_SECONDS);
     }
 
-    // 退出/断线时将内存中的在线时长持久化到 extend_value 表
+    /**
+     * 退出时只允许写入“今天且合法”的在线时长，避免把 -1 或跨天残留值写回每日扩展表。
+     */
     public synchronized void updateOnlineTime() {
-        getAbstractPlayerInteraction().saveOrUpdateAccountExtendValue(ExtendKey.ONLINE_TIME.getKey(), String.valueOf(m_iCurrentOnlineTime), true);
+        syncOnlineTimeToDailyRecord();
     }
 
-    // 从 DB 读取今日在线时长, 如果记录不存在或不是今天的则返回 0
-    private int loadOnlineTimeFromDB() {
-        ExtendValueDO record = ExtendUtil.getExtendValue(String.valueOf(getAccountId()), ExtendType.ACCOUNT_EXTEND_DAILY.getType(), ExtendKey.ONLINE_TIME.getKey());
-        if (record == null || record.getCreateTime() == null) return 0;
-        if (!record.getCreateTime().toLocalDate().isEqual(LocalDate.now())) return 0;
-        try {
-            int v = Integer.parseInt(record.getExtendValue());
-            return (v < 0 || v > MAX_DAILY_ONLINE_TIME_SECONDS) ? 0 : v;
-        } catch (NumberFormatException e) {
+    /**
+     * 将当前在线时长同步到每日扩展值。
+     */
+    public synchronized void syncOnlineTimeToDailyRecord() {
+        persistOnlineTimeForDate(LocalDate.now());
+    }
+
+    /**
+     * 会话迁移前先同步在线时长。
+     */
+    public synchronized void syncOnlineTimeBeforeSessionTransition() {
+        syncOnlineTimeToDailyRecord();
+    }
+
+    private boolean isOnlineTimeInitialized() {
+        return m_dCurrentOnlineDate != null && m_iCurrentOnlineTime >= 0;
+    }
+
+    private int resolvePersistedOnlineTime(LocalDate targetDate) {
+        if (targetDate.equals(m_dCurrentOnlineDate)) {
+            return normalizeOnlineTime(m_iCurrentOnlineTime);
+        }
+        // 当前内存值如果不属于今天，优先回读今天的库值，避免旧角色把昨天的数据覆盖到今天。
+        return loadOnlineTimeForDate(targetDate);
+    }
+
+    private int loadOnlineTimeForDate(LocalDate targetDate) {
+        ExtendValueDO extendValueDO = ExtendUtil.getExtendValue(String.valueOf(getAccountId()), ExtendType.ACCOUNT_EXTEND_DAILY.getType(), DAILY_ONLINE_TIME_EXTEND_NAME);
+        if (!isOnlineTimeRecordForDate(extendValueDO, targetDate)) {
             return 0;
         }
+        return parseOnlineTime(extendValueDO.getExtendValue());
+    }
+
+    private boolean isOnlineTimeRecordForDate(ExtendValueDO extendValueDO, LocalDate targetDate) {
+        if (extendValueDO == null || extendValueDO.getCreateTime() == null) {
+            return false;
+        }
+        return extendValueDO.getCreateTime().toLocalDate().isEqual(targetDate);
+    }
+
+    private int parseOnlineTime(String onlineTimeValue) {
+        if (onlineTimeValue == null || onlineTimeValue.isEmpty()) {
+            return 0;
+        }
+        try {
+            return normalizeOnlineTime(Integer.parseInt(onlineTimeValue));
+        } catch (NumberFormatException ignore) {
+            return 0;
+        }
+    }
+
+    private int normalizeOnlineTime(int onlineTime) {
+        if (onlineTime < 0 || onlineTime > MAX_DAILY_ONLINE_TIME_SECONDS) {
+            return 0;
+        }
+        return onlineTime;
+    }
+
+    /**
+     * 将指定日期的在线时长同时同步到角色内存与每日扩展值。
+     */
+    private void persistOnlineTimeForDate(LocalDate targetDate) {
+        int safeOnlineTime = resolvePersistedOnlineTime(targetDate);
+        applyOnlineTimeState(targetDate, safeOnlineTime);
+        getAbstractPlayerInteraction().saveOrUpdateAccountExtendValue(DAILY_ONLINE_TIME_EXTEND_NAME, String.valueOf(safeOnlineTime), true);
+    }
+
+    private void applyOnlineTimeState(LocalDate targetDate, int onlineTime) {
+        m_dCurrentOnlineDate = targetDate;
+        m_iCurrentOnlineTime = normalizeOnlineTime(onlineTime);
     }
 
     /**

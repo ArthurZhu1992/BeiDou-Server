@@ -8,7 +8,6 @@
             <a-input-number
               v-model="condition.gachaponId"
               :placeholder="$t('gachapon.placeholder.gachaponId')"
-              @keydown.enter="loadData"
             />
             <a-button type="primary" @click="loadData">
               {{ $t('button.search') }}

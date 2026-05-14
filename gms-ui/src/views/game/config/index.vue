@@ -34,7 +34,6 @@
             <a-input
               v-model="condition.filter"
               :placeholder="$t('config.placeholder.filter')"
-              @keydown.enter="searchData"
             />
             <a-button type="primary" @click="searchData">
               {{ $t('button.search') }}

@@ -24,7 +24,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.*;
-import java.util.stream.Collectors;
 
 import static com.mybatisflex.core.query.QueryMethods.distinct;
 import static org.gms.dao.entity.table.CharactersDOTableDef.CHARACTERS_D_O;
@@ -390,12 +389,12 @@ public class InventoryService {
         if (petId == null || itemIds == null || itemIds.isEmpty()) {
             return;
         }
-        petignoresMapper.insertBatch(itemIds.stream()
-                .map(itemId -> PetignoresDO.builder()
+        for (Integer itemId : itemIds) {
+            petignoresMapper.insertSelective(PetignoresDO.builder()
                     .petid(petId)
                     .itemid(itemId)
-                    .build())
-                .collect(Collectors.toList()));
+                    .build());
+        }
     }
 
         /**

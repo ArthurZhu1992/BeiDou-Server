@@ -98,7 +98,6 @@ import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.time.LocalDate;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -9911,69 +9910,24 @@ public class Character extends AbstractCharacterObject {
     }
 
     /////////////////////////////////////////////////////////////////////////////////
-    // 角色在线时长
-    // 设计要点:
-    //   - m_iCurrentOnlineTime 是直接字段,由定时任务每5s递增,不依赖DB实时计算
-    //   - Character 对象在换频道/进商城等会话迁移时仍驻留 World 内存,
-    //     字段值不丢失,因此迁移前无需调 updateOnlineTime 写库
-    //   - 登录时 initOnlineTimeForToday() 从 DB 恢复今日已有时长
-    //   - 跨日归零在 tickOnlineTime 中检测日期变化完成
-    //   - 退出时 updateOnlineTime() 将内存值写入 extend_value 表持久化
-    /////////////////////////////////////////////////////////////////////////////////
-    // 每日在线时长上限: 86400秒(24小时)
-    private static final int MAX_DAILY_ONLINE_TIME_SECONDS = 24 * 60 * 60;
-    // 定时任务递增步长: 每5秒 +1
-    private static final int ONLINE_TIME_TICK_SECONDS = 5;
+    //module: 角色在线时间
+    private int m_iCurrentOnlineTime = -1;//-1用于服务器重启时角色初始变量时间
+    private AtomicBoolean timeUpdating = new AtomicBoolean(false);
 
-    // 当前在线时长(秒), 0 = 新的一天尚未产生时长
-    private int m_iCurrentOnlineTime = 0;
-    // 当前在线时长所属日期, 用于跨日归零判断
-    private LocalDate m_dCurrentOnlineDate;
-
-    // 获取当前在线时长(秒)
-    public synchronized int getCurrentOnlineTime() {
-        return m_iCurrentOnlineTime;
+    public int getCurrentOnlineTime() {
+        return this.m_iCurrentOnlineTime;
     }
 
-    // 设置当前在线时长(秒), 自动钳制到 [0, MAX_DAILY_ONLINE_TIME_SECONDS]
-    public synchronized void setCurrentOnlineTime(final int iTime) {
-        m_iCurrentOnlineTime = Math.max(0, Math.min(iTime, MAX_DAILY_ONLINE_TIME_SECONDS));
+    public void setCurrentOnlineTime(final int iTime) {
+        this.m_iCurrentOnlineTime = iTime;
     }
 
-    // 登录时从 DB 恢复今日在线时长, 记录当前日期
-    public synchronized void initOnlineTimeForToday() {
-        m_iCurrentOnlineTime = loadOnlineTimeFromDB();
-        m_dCurrentOnlineDate = LocalDate.now();
-    }
-
-    // 定时任务每5s调用一次: 跨日归零, 未达上限则 +5s
-    public synchronized void tickOnlineTime() {
-        LocalDate today = LocalDate.now();
-        if (!today.equals(m_dCurrentOnlineDate)) {
-            m_iCurrentOnlineTime = 0;
-            m_dCurrentOnlineDate = today;
+    public void updateOnlineTime() {
+        if (m_iCurrentOnlineTime == -1) {
             return;
         }
-        if (m_iCurrentOnlineTime >= MAX_DAILY_ONLINE_TIME_SECONDS) return;
-        m_iCurrentOnlineTime += ONLINE_TIME_TICK_SECONDS;
-    }
-
-    // 退出/断线时将内存中的在线时长持久化到 extend_value 表
-    public synchronized void updateOnlineTime() {
-        getAbstractPlayerInteraction().saveOrUpdateAccountExtendValue(ExtendKey.ONLINE_TIME.getKey(), String.valueOf(m_iCurrentOnlineTime), true);
-    }
-
-    // 从 DB 读取今日在线时长, 如果记录不存在或不是今天的则返回 0
-    private int loadOnlineTimeFromDB() {
-        ExtendValueDO record = ExtendUtil.getExtendValue(String.valueOf(getAccountId()), ExtendType.ACCOUNT_EXTEND_DAILY.getType(), ExtendKey.ONLINE_TIME.getKey());
-        if (record == null || record.getCreateTime() == null) return 0;
-        if (!record.getCreateTime().toLocalDate().isEqual(LocalDate.now())) return 0;
-        try {
-            int v = Integer.parseInt(record.getExtendValue());
-            return (v < 0 || v > MAX_DAILY_ONLINE_TIME_SECONDS) ? 0 : v;
-        } catch (NumberFormatException e) {
-            return 0;
-        }
+        String strNewOnlineTime = String.valueOf(m_iCurrentOnlineTime);
+        getAbstractPlayerInteraction().saveOrUpdateAccountExtendValue(ExtendKey.ONLINE_TIME.getKey(), strNewOnlineTime, true);
     }
 
     /**

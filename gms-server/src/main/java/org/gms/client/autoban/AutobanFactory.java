@@ -66,7 +66,9 @@ public enum AutobanFactory {
     FAST_ITEM_PICKUP(I18nUtil.getMessage("autoban.name.FAST_ITEM_PICKUP"), 5, SECONDS.toMillis(30)),
     FAST_ATTACK(I18nUtil.getMessage("autoban.name.FAST_ATTACK"), 10, SECONDS.toMillis(30)),
     MPCON(I18nUtil.getMessage("autoban.name.MPCON"), 25, SECONDS.toMillis(30)),
-    ATTACK_INTERVAL(I18nUtil.getMessage("autoban.name.ATTACK_INTERVAL"), 60, SECONDS.toMillis(60));
+    ATTACK_INTERVAL(I18nUtil.getMessage("autoban.name.ATTACK_INTERVAL"), 60, SECONDS.toMillis(60)),
+    MOB_VAC(I18nUtil.getMessage("autoban.name.MOB_VAC"), 10, SECONDS.toMillis(120)),
+    MOB_VAC_START_POS(I18nUtil.getMessage("autoban.name.MOB_VAC_START_POS"), 5, SECONDS.toMillis(60));
 
     private static final Logger log = LoggerFactory.getLogger(AutobanFactory.class);
     private static final Set<Integer> ignoredChrIds = new HashSet<>();

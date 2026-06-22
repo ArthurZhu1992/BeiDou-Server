@@ -24,6 +24,7 @@ package org.gms.client;
 
 import lombok.Getter;
 import lombok.Setter;
+import org.gms.client.autoban.AutobanFactory;
 import org.gms.client.autoban.AutobanManager;
 import org.gms.client.creator.CharacterFactoryRecipe;
 import org.gms.client.inventory.*;
@@ -428,6 +429,10 @@ public class Character extends AbstractCharacterObject {
     @Getter
     @Setter
     private boolean banned = false;
+    // MOB_VAC: 累计漂移追踪
+    private final Map<Integer, DriftEntry> mobVacDrift = new HashMap<>();
+    private static final long DRIFT_TIMEOUT_MS = 30_000L;
+    private static final int DRIFT_TRIGGER_PX = 1000;
     private boolean blockCashShop = false;
     private boolean allowExpGain = true;
     private byte pendantExp = 0, doorSlot = -1;
@@ -1730,6 +1735,8 @@ public class Character extends AbstractCharacterObject {
         this.mapTransitioning.set(true);
         // 显式清空“传送距离校验上下文”，避免跨图后旧上下文残留
         clearTeleportDistanceContext();
+        // MOB_VAC: 换图清空累计漂移
+        mobVacDrift.clear();
 
         this.unregisterChairBuff();
         this.clearBanishPlayerData();
@@ -1883,6 +1890,8 @@ public class Character extends AbstractCharacterObject {
                 cpnLock.unlock();
             }
         }
+        // MOB_VAC: 停止控制时清空该 OID 的累计漂移
+        mobVacDrift.remove(monster.getObjectId());
     }
 
     public int getNumControlledMonsters() {
@@ -9348,6 +9357,34 @@ public class Character extends AbstractCharacterObject {
 
     public void setAutoBanManager(AutobanManager autoBan) {
         this.autoBan = autoBan;
+    }
+
+    // === MOB_VAC: 累计漂移追踪 ===
+    private static final class DriftEntry {
+        int score;
+        long lastUpdate;
+        DriftEntry(int score, long lastUpdate) {
+            this.score = score;
+            this.lastUpdate = lastUpdate;
+        }
+    }
+
+    public void checkMobVacDrift(int oid, double deviationPx) {
+        long now = System.currentTimeMillis();
+        DriftEntry entry = mobVacDrift.get(oid);
+        if (entry != null && now - entry.lastUpdate > DRIFT_TIMEOUT_MS) {
+            entry.score = 0;
+        }
+        int score = (entry != null ? entry.score : 0) + (int) deviationPx;
+        mobVacDrift.put(oid, new DriftEntry(score, now));
+
+        if (score > DRIFT_TRIGGER_PX) {
+            String reason = String.format("玩家%s 地图ID：%d 怪物OID：%d 累计漂移：%dpx",
+                    getName(), getMapId(), oid, score);
+            AutobanFactory.MOB_VAC.addPoint(getAutoBanManager(), reason);
+            log.warn(reason);
+            mobVacDrift.put(oid, new DriftEntry(score / 2, now));
+        }
     }
 
     public void equippedItem(Equip equip) {

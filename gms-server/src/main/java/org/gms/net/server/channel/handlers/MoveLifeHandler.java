@@ -23,7 +23,6 @@ package org.gms.net.server.channel.handlers;
 
 import org.gms.client.Character;
 import org.gms.client.Client;
-import org.gms.client.autoban.AutobanFactory;
 import org.gms.config.GameConfig;
 import org.gms.net.packet.InPacket;
 import org.slf4j.Logger;
@@ -141,27 +140,6 @@ public final class MoveLifeHandler extends AbstractMovementPacketHandler {
         short start_y = p.readShort(); // hmm...
         Point startPos = new Point(start_x, start_y - 2);
         Point serverStartPos = new Point(monster.getPosition());
-
-        // MOB_VAC: 起始位置偏差 > 500px 实锤
-        if (!monster.getStats().isBoss()) {
-            double deviation = startPos.distanceSq(serverStartPos);
-            if (deviation > 500 * 500) {
-                String reason = String.format("玩家%s 地图ID：%d 怪物ID：%d OID：%d 起始偏差：%d clientStart：%s serverPos：%s",
-                        player.getName(), player.getMapId(), monster.getId(), objectid,
-                        (int) Math.sqrt(deviation), startPos, serverStartPos);
-                AutobanFactory.MOB_VAC_START_POS.addPoint(player.getAutoBanManager(), reason);
-                log.warn(reason);
-                return;
-            }
-        }
-
-        // MOB_VAC: 小偏差累计漂移检测
-        if (!monster.getStats().isBoss()) {
-            double deviation = Math.sqrt(startPos.distanceSq(serverStartPos));
-            if (deviation > 50) {
-                player.checkMobVacDrift(monster.getObjectId(), deviation);
-            }
-        }
 
         Boolean aggro = monster.aggroMoveLifeUpdate(player);
         if (aggro == null) {

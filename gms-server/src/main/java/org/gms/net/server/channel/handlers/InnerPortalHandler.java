@@ -23,12 +23,10 @@ package org.gms.net.server.channel.handlers;
 
 import org.gms.client.Character;
 import org.gms.client.Client;
-import org.gms.client.inventory.Pet;
 import org.gms.net.AbstractPacketHandler;
 import org.gms.net.packet.InPacket;
 import org.gms.server.maps.MapleMap;
 import org.gms.server.maps.Portal;
-import org.gms.util.PacketCreator;
 
 import java.awt.Point;
 
@@ -118,14 +116,5 @@ public final class InnerPortalHandler extends AbstractPacketHandler {
     private static void movePlayerInMap(Character player, Point afterPos) {
         MapleMap map = player.getMap();
         map.movePlayer(player, afterPos);
-
-        // 同步宠物坐标到玩家新位置，防止宠物拾取反作弊因坐标残留误判
-        for (Pet pet : player.getPets()) {
-            if (pet == null) {
-                break;
-            }
-            pet.setPos(map.getGroundBelow(player.getPosition()));
-            player.sendPacket(PacketCreator.showPet(player, pet, false, false));
-        }
     }
 }

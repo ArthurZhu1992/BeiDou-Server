@@ -11,9 +11,7 @@ import org.gms.server.life.MonsterInformationProvider;
 import org.gms.service.ConfigService;
 import org.gms.util.Pair;
 
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.function.Function;
 
 /**
@@ -73,22 +71,6 @@ public class GameConfig {
     }
 
     public static void update(GameConfigDO gameConfigDO) {
-        // 清除该 configCode 在所有旧 subType 下的缓存，避免 subType 变更后残留旧值
-        JSONObject typeProp = config.properties.getJSONObject(gameConfigDO.getConfigType());
-        if (typeProp != null) {
-            for (Map.Entry<String, Object> entry : new ArrayList<>(typeProp.entrySet())) {
-                JSONObject subProp = typeProp.getJSONObject(entry.getKey());
-                if (subProp != null) {
-                    subProp.remove(gameConfigDO.getConfigCode().toLowerCase());
-                    if (subProp.isEmpty()) {
-                        typeProp.remove(entry.getKey());
-                    }
-                }
-            }
-            if (typeProp.isEmpty()) {
-                config.properties.remove(gameConfigDO.getConfigType());
-            }
-        }
         JSONObject valueProp = getValueProp(gameConfigDO.getConfigType(), gameConfigDO.getConfigSubType(), gameConfigDO.getConfigCode());
         if (valueProp == null) {
             add(gameConfigDO);

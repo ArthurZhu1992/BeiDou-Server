@@ -1,5 +1,5 @@
 INSERT INTO `game_config`(`config_type`, `config_sub_type`, `config_clazz`, `config_code`, `config_value`, `config_desc`, `update_time`)
-SELECT 'server', '调试信息', 'java.lang.Boolean', 'use_enable_gachapon_log', 'true', 'use_enable_gachapon_log', '2026-06-23 20:25:36'
+SELECT 'server', 'Debug', 'java.lang.Boolean', 'use_enable_gachapon_log', 'false', 'use_enable_gachapon_log', '2026-06-23 20:25:36'
 WHERE NOT EXISTS (
     SELECT 1 FROM `game_config` WHERE `config_code` = 'use_enable_gachapon_log'
 );

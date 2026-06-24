@@ -5,3 +5,13 @@ logs
 src/main/resources/static
 docker-db-data
 .idea
+
+# dependencies
+node_modules/
+
+# temp files
+tmp/
+tmp_*.xml
+
+# archives
+*.zip

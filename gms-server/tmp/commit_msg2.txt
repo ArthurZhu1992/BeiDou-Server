@@ -1,0 +1,15 @@
+﻿Fix: 背包满提示文字修正
+
+将 ItemAction.Message1 中硬编码的消耗品栏改为通用背包
+
+问题：
+announceInventoryLimit() 对所有背包类型(装备/消耗/设置/其他/现金)
+统一使用 ItemAction.Message1 提示，但原文字写死了消耗品栏，
+导致其他栏满时也显示为消耗栏空间不足，误导玩家。
+
+依据：
+- ItemAction.check() 失败时调用 announceInventoryLimit()
+- 该方法不区分 InventoryType，无法动态拼接栏位名
+- 英文版已使用通用提示
+   Please check if you have enough space in your inventory.
+- 中英应对齐，不指定特定栏位

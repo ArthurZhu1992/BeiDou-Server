@@ -881,6 +881,19 @@ public abstract class AbstractDealDamageHandler extends AbstractPacketHandler {
                 calcDmgMax = fixed;
             }
         }
+        if (effect != null) {
+            int maxattack = Math.max(effect.getBulletCount(), effect.getAttackCount());
+            if (shadowPartner) {
+                maxattack = maxattack * 2;
+            }
+            if (ret.numDamage > maxattack) {
+                if (ret.numDamage > maxattack * 2) {
+                    AutobanFactory.DAMAGE_HACK.addPoint(chr.getAutoBanManager(), "Too many lines: " + ret.numDamage + " Max lines: " + maxattack + " SID: " + ret.skill + " Map: " + chr.getMap().getMapName() + " (" + chr.getMapId() + ")");
+                } else {
+                    AutobanFactory.DAMAGE_HACK.alert(chr, "Too many lines: " + ret.numDamage + " Max lines: " + maxattack + " SID: " + ret.skill + " Map: " + chr.getMap().getMapName() + " (" + chr.getMapId() + ")");
+                }
+            }
+        }
         for (int i = 0; i < ret.numAttacked; i++) {
             int oid = p.readInt();
             p.skip(14);
@@ -999,17 +1012,6 @@ public abstract class AbstractDealDamageHandler extends AbstractPacketHandler {
                     // If the skill is a crit, inverse the damage to make it show up on clients.
                     damage = -Integer.MAX_VALUE + damage - 1;
                 }
-
-                if (effect != null) {
-                    int maxattack = Math.max(effect.getBulletCount(), effect.getAttackCount());
-                    if (shadowPartner) {
-                        maxattack = maxattack * 2;
-                    }
-                    if (ret.numDamage > maxattack) {
-                        AutobanFactory.DAMAGE_HACK.addPoint(chr.getAutoBanManager(), "Too many lines: " + ret.numDamage + " Max lines: " + maxattack + " SID: " + ret.skill + " MobID: " + (monster != null ? monster.getId() : "null") + " Map: " + chr.getMap().getMapName() + " (" + chr.getMapId() + ")");
-                    }
-                }
-
                 allDamageNumbers.add(damage);
             }
             if (ret.skill != Corsair.RAPID_FIRE || ret.skill != Aran.HIDDEN_FULL_DOUBLE || ret.skill != Aran.HIDDEN_FULL_TRIPLE || ret.skill != Aran.HIDDEN_OVER_DOUBLE || ret.skill != Aran.HIDDEN_OVER_TRIPLE) {

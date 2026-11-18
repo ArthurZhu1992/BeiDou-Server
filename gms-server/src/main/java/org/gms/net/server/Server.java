@@ -92,6 +92,7 @@ public class Server {
     }
 
     private static final Logger log = LoggerFactory.getLogger(Server.class);
+    private static final long SPAM_CLOCK_ORIGIN_NANOS = System.nanoTime();
     private static Server instance = null;
 
     public static Server getInstance() {
@@ -114,7 +115,10 @@ public class Server {
     private final Map<Integer, Set<Integer>> accountChars = new HashMap<>();
     private final Map<Integer, Short> accountCharacterCount = new HashMap<>();
     private final Map<Integer, Integer> worldChars = new HashMap<>();
-    private final Map<String, Integer> transitioningChars = new HashMap<>();
+    private final Map<Integer, CharacterTransition> transitioningChars = new HashMap<>();
+    private long nextTransitionGeneration;
+    private record CharacterTransition(Client source, String remoteHost, int targetWorld, int targetChannel,
+                                       long generation, long expiresAt) {}
     private final List<Pair<Integer, String>> worldRecommendedList = new LinkedList<>();
     private final Map<Integer, Guild> guilds = new HashMap<>(100);
     private final Map<Client, Long> inLoginState = new HashMap<>(100);
@@ -138,6 +142,7 @@ public class Server {
 
     private final AtomicLong currentTime = new AtomicLong(0);
     private long serverCurrentTime = 0;
+    private volatile long spamWindowMillis = 1;
 
     private volatile boolean availableDeveloperRoom = false;
     @Getter
@@ -145,6 +150,24 @@ public class Server {
     private boolean online = false;
     public static long uptime = System.currentTimeMillis();
     private long nextTime;
+
+    /**
+     * 关停流程重入保护。
+     *
+     * shutdownInternal 可被多个路径并发调用：
+     *  - ShutdownCommand 走 TimerManager 延时调度
+     *  - ConfigService 用虚拟线程触发 restart
+     *  - ServerManager.destroy()（Spring 容器关闭钩子，等价于 addShutdownHook）
+     *  - ServerController.stopServer/restartServer
+     * synchronized 串行化调用方，但调用方仍会阻塞等锁——Spring 容器关闭钩子
+     * 在 System.exit 时若卡在等锁，会导致端口不释放、JVM 退出超时（"关了起不来"根因）。
+     * 用 volatile 标志让重入调用在 synchronized 外直接返回。
+     */
+    private volatile boolean shuttingDown = false;
+
+    public boolean isShuttingDown() {
+        return shuttingDown;
+    }
 
     private static final NpcService npcService = ServerManager.getApplicationContext().getBean(NpcService.class);
     private static final NxCouponService nxCouponService = ServerManager.getApplicationContext().getBean(NxCouponService.class);
@@ -171,7 +194,9 @@ public class Server {
     }
 
     public int getCurrentTimestamp() {
-        return (int) (Server.getInstance().getCurrentTime() - Server.uptime);
+        // 使用单调时钟分桶，保留毫秒单位供恢复处理器计算间隔。
+        long elapsedMillis = NANOSECONDS.toMillis(System.nanoTime() - SPAM_CLOCK_ORIGIN_NANOS);
+        return (int) (elapsedMillis - elapsedMillis % spamWindowMillis);
     }
 
     public long getCurrentTime() {  // returns a slightly delayed time value, under frequency of UPDATE_INTERVAL
@@ -549,7 +574,7 @@ public class Server {
 
     public List<Integer> getActiveCoupons() {
         synchronized (activeCoupons) {
-            return activeCoupons;
+            return List.copyOf(activeCoupons);
         }
     }
 
@@ -573,9 +598,9 @@ public class Server {
                 } else {
                     activeCoupons.add(couponId);
                 }
-
-                commitActiveCoupons();
             }
+            // 角色刷新会读取活动券列表，遍历角色时先释放列表锁。
+            commitActiveCoupons();
         }
     }
 
@@ -772,7 +797,9 @@ public class Server {
         disconnectIdlesOnLoginTask();
 
         long timeLeft = getTimeLeftForNextHour();
-        tMan.register(new CharacterDiseaseTask(), GameConfig.getServerLong("update_interval"), GameConfig.getServerLong("update_interval"));
+        long updateIntervalMillis = GameConfig.getServerLong("update_interval");
+        tMan.register(new CharacterDiseaseTask(), updateIntervalMillis, updateIntervalMillis);
+        spamWindowMillis = updateIntervalMillis;
         tMan.register(new CouponTask(), HOURS.toMillis(1), timeLeft);
         tMan.register(new RankingCommandTask(), MINUTES.toMillis(5), MINUTES.toMillis(5));
         tMan.register(new RankingLoginTask(), HOURS.toMillis(1), timeLeft);
@@ -807,16 +834,29 @@ public class Server {
         }
     }
 
-    public void disbandAlliance(int id) {
+    public boolean removeAllianceFromMemory(int id) {
+        boolean synchronizedAllGuilds = true;
         synchronized (alliances) {
-            Alliance alliance = alliances.get(id);
+            Alliance alliance = alliances.remove(id);
             if (alliance != null) {
-                for (Integer gid : alliance.getGuilds()) {
-                    guilds.get(gid).setAllianceId(0);
+                synchronized (guilds) {
+                    for (Guild guild : guilds.values()) {
+                        if (guild.getAllianceId() != id) {
+                            continue;
+                        }
+                        try {
+                            guild.setAllianceIdInMemory(0);
+                            guild.resetAllianceGuildPlayersRankInMemory();
+                        } catch (RuntimeException e) {
+                            synchronizedAllGuilds = false;
+                            log.error(I18nUtil.getLogMessage("Server.alliance.error1"),
+                                    id, guild.getId(), e);
+                        }
+                    }
                 }
-                alliances.remove(id);
             }
         }
+        return synchronizedAllGuilds;
     }
 
     public void allianceMessage(int id, Packet packet, int exception, int guildex) {
@@ -834,51 +874,39 @@ public class Server {
         }
     }
 
-    public boolean addGuildtoAlliance(int aId, int guildId) {
-        Alliance alliance = alliances.get(aId);
-        if (alliance != null) {
-            alliance.addGuild(guildId);
-            guilds.get(guildId).setAllianceId(aId);
+    public boolean addGuildToAlliance(int aId, int guildId, int guildMasterId) {
+        Alliance alliance = getAlliance(aId);
+        Guild guild = guilds.get(guildId);
+        if (alliance == null || guild == null) {
+            return false;
+        }
+        synchronized (alliance) {
+            if (!alliance.addGuildAndSave(guildId, guildMasterId)) {
+                return false;
+            }
+            guild.setAllianceIdInMemory(aId);
+            guild.resetAllianceGuildPlayersRankInMemory();
             return true;
         }
-        return false;
     }
 
     public boolean removeGuildFromAlliance(int aId, int guildId) {
-        Alliance alliance = alliances.get(aId);
-        if (alliance != null) {
-            alliance.removeGuild(guildId);
-            guilds.get(guildId).setAllianceId(0);
+        Alliance alliance = getAlliance(aId);
+        Guild guild = guilds.get(guildId);
+        if (alliance == null || guild == null) {
+            return false;
+        }
+        synchronized (alliance) {
+            if (!alliance.canRemoveGuild(guildId)) {
+                return false;
+            }
+            if (!alliance.removeGuildAndSave(guildId)) {
+                return false;
+            }
+            guild.setAllianceIdInMemory(0);
+            guild.resetAllianceGuildPlayersRankInMemory();
             return true;
         }
-        return false;
-    }
-
-    public boolean setAllianceRanks(int aId, String[] ranks) {
-        Alliance alliance = alliances.get(aId);
-        if (alliance != null) {
-            alliance.setRankTitle(ranks);
-            return true;
-        }
-        return false;
-    }
-
-    public boolean setAllianceNotice(int aId, String notice) {
-        Alliance alliance = alliances.get(aId);
-        if (alliance != null) {
-            alliance.setNotice(notice);
-            return true;
-        }
-        return false;
-    }
-
-    public boolean increaseAllianceCapacity(int aId, int inc) {
-        Alliance alliance = alliances.get(aId);
-        if (alliance != null) {
-            alliance.increaseCapacity(inc);
-            return true;
-        }
-        return false;
     }
 
     public int createGuild(int leaderId, String name) {
@@ -957,17 +985,20 @@ public class Server {
         return 0;
     }
 
-    public boolean setGuildAllianceId(int gId, int aId) {
-        Guild guild = guilds.get(gId);
-        if (guild != null) {
-            guild.setAllianceId(aId);
-            return true;
+    public boolean setGuildAllianceIdInMemory(int guildId, int allianceId) {
+        Guild guild = guilds.get(guildId);
+        if (guild == null) {
+            return false;
         }
-        return false;
+        guild.setAllianceIdInMemory(allianceId);
+        return true;
     }
 
-    public void resetAllianceGuildPlayersRank(int gId) {
-        guilds.get(gId).resetAllianceGuildPlayersRank();
+    public void resetAllianceGuildPlayersRankInMemory(int guildId) {
+        Guild guild = guilds.get(guildId);
+        if (guild != null) {
+            guild.resetAllianceGuildPlayersRankInMemory();
+        }
     }
 
     public void leaveGuild(GuildCharacter mgc) {
@@ -1026,12 +1057,26 @@ public class Server {
         }
     }
 
-    public void disbandGuild(int gid) {
+    public boolean disbandGuild(int gid) {
+        Guild guild;
         synchronized (guilds) {
-            Guild g = guilds.get(gid);
-            g.disbandGuild();
-            guilds.remove(gid);
+            guild = guilds.get(gid);
         }
+        if (guild == null) {
+            log.warn(I18nUtil.getLogMessage("Server.disbandGuild.warn1"), gid);
+            return false;
+        }
+
+        // 家族解散包含数据库更新和跨频道广播，不能持有全局 guilds 锁执行。
+        // 否则任一步骤阻塞都会让所有登录线程卡在 getGuild()。
+        if (!guild.disbandGuild()) {
+            return false;
+        }
+
+        synchronized (guilds) {
+            guilds.remove(gid, guild);
+        }
+        return true;
     }
 
     public boolean increaseGuildCapacity(int gid) {
@@ -1503,60 +1548,67 @@ public class Server {
     }
 
     public void setCharacteridInTransition(Client client, int charId) {
-        String remoteIp = getRemoteHost(client);
+        setCharacteridInTransition(client, charId, client.getChannel());
+    }
 
+    public void setCharacteridInTransition(Client client, int charId, int targetChannel) {
+        long generation;
         lgnWLock.lock();
         try {
-            transitioningChars.put(remoteIp, charId);
-        } finally {
-            lgnWLock.unlock();
+            if (transitioningChars.containsKey(charId)) throw new IllegalStateException(I18nUtil.getExceptionMessage("CHARACTER_SAVE_UNAVAILABLE"));
+            generation = ++nextTransitionGeneration;
+            int targetWorld = client.getPlayer() == null ? client.getWorld() : client.getPlayer().getWorld();
+            transitioningChars.put(charId, new CharacterTransition(client, getRemoteHost(client), targetWorld, targetChannel, generation,
+                    System.nanoTime() + SECONDS.toNanos(30)));
+        } finally { lgnWLock.unlock(); }
+        try {
+            TimerManager.getInstance().schedule(() -> {
+                boolean expired;
+                lgnWLock.lock();
+                try {
+                    CharacterTransition pending = transitioningChars.get(charId);
+                    expired = pending != null && pending.source() == client && pending.generation() == generation;
+                    if (expired) transitioningChars.remove(charId);
+                } finally { lgnWLock.unlock(); }
+                if (expired) Thread.startVirtualThread(() -> client.expireUnclaimedTransition(charId));
+            }, 30_000L);
+        } catch (RuntimeException failure) {
+            lgnWLock.lock();
+            try { transitioningChars.remove(charId); } finally { lgnWLock.unlock(); }
+            client.expireUnclaimedTransition(charId);
+            throw failure;
         }
     }
 
     public boolean validateCharacteridInTransition(Client client, int charId) {
-        if (!GameConfig.getServerBoolean("use_ip_validation")) {
-            return true;
-        }
-
-        String remoteIp = getRemoteHost(client);
-
         lgnWLock.lock();
         try {
-            Integer cid = transitioningChars.remove(remoteIp);
-            return cid != null && cid.equals(charId);
-        } finally {
-            lgnWLock.unlock();
-        }
+            CharacterTransition pending = transitioningChars.get(charId);
+            if (pending == null || System.nanoTime() - pending.expiresAt() >= 0
+                    || client.getSessionId() <= pending.source().getSessionId()
+                    || client.getWorld() != pending.targetWorld() || client.getChannel() != pending.targetChannel()
+                    || (GameConfig.getServerBoolean("use_ip_validation") && !pending.remoteHost().equals(getRemoteHost(client)))) return false;
+            client.setAccID(pending.source().getAccID());
+            transitioningChars.remove(charId);
+            return true;
+        } finally { lgnWLock.unlock(); }
     }
 
     public Integer freeCharacteridInTransition(Client client) {
-        if (!GameConfig.getServerBoolean("use_ip_validation")) {
-            return null;
-        }
-
-        String remoteIp = getRemoteHost(client);
-
         lgnWLock.lock();
         try {
-            return transitioningChars.remove(remoteIp);
-        } finally {
-            lgnWLock.unlock();
-        }
+            for (var iterator = transitioningChars.entrySet().iterator(); iterator.hasNext();) {
+                var entry = iterator.next();
+                if (entry.getValue().source() == client) { iterator.remove(); return entry.getKey(); }
+            }
+            return null;
+        } finally { lgnWLock.unlock(); }
     }
 
     public boolean hasCharacteridInTransition(Client client) {
-        if (!GameConfig.getServerBoolean("use_ip_validation")) {
-            return true;
-        }
-
-        String remoteIp = getRemoteHost(client);
-
         lgnRLock.lock();
-        try {
-            return transitioningChars.containsKey(remoteIp);
-        } finally {
-            lgnRLock.unlock();
-        }
+        try { return transitioningChars.values().stream().anyMatch(value -> value.source() == client); }
+        finally { lgnRLock.unlock(); }
     }
 
     public void registerLoginState(Client c) {
@@ -1614,15 +1666,54 @@ public class Server {
         return () -> shutdownInternal(restart);
     }
 
-    public synchronized void shutdownInternal(boolean restart) {
+    public void shutdownInternal(boolean restart) {
+        // 重入保护在 synchronized 外判断，避免 Spring 关闭钩子等调用方
+        // 在 System.exit 时卡在等锁导致 JVM 退出超时、端口不释放。
+        if (shuttingDown) {
+            log.warn("Server shutdownInternal skipped: already in progress (restart={})", restart);
+            return;
+        }
+        synchronized (this) {
+            if (shuttingDown) {
+                log.warn("Server shutdownInternal skipped: already in progress (restart={})", restart);
+                return;
+            }
+            shuttingDown = true;
+            try {
+                doShutdownInternal(restart);
+            } finally {
+                // restart 路径在 doShutdownInternal 末尾重置 shuttingDown=false，
+                // 以便 init() 启动后能再次响应关停调用；非 restart 路径同样重置，
+                // 让后续手动 startServer() 不被旧标志挡住。
+                shuttingDown = false;
+            }
+        }
+    }
+
+    private synchronized void doShutdownInternal(boolean restart) {
         log.info(I18nUtil.getLogMessage("Server.shutdownInternal.info1"), restart ?
                 I18nUtil.getLogMessage("Server.shutdownInternal.info2") : I18nUtil.getLogMessage("Server.shutdownInternal.info3"));
         if (getWorlds() == null) {
             return;//already shutdown
         }
+        List<Map.Entry<Integer, CharacterTransition>> unclaimed;
+        lgnWLock.lock();
+        try {
+            unclaimed = new ArrayList<>(transitioningChars.entrySet());
+            transitioningChars.clear();
+        } finally { lgnWLock.unlock(); }
+        for (var transition : unclaimed) transition.getValue().source().expireUnclaimedTransition(transition.getKey());
+        for (World world : getWorlds()) {
+            for (Character character : world.getPlayerStorage().getAllCharacters()) {
+                if (character.isLoggedIn() && !character.saveCharToDB(true)) {
+                    log.error(I18nUtil.getLogMessage("CharacterSave.shutdownFailed"), character.getId());
+                }
+            }
+        }
         for (World w : getWorlds()) {
             w.shutdown();
         }
+        Client.flushPendingDisconnectsForMaintenance();
 
         hpMpAlertService.saveAll();
         hpMpAlertService.clear();
@@ -1648,6 +1739,8 @@ public class Server {
         if (restart) {
             log.info(I18nUtil.getLogMessage("Server.shutdownInternal.info5"));
             instance = null;
+            // 重置标志，让 init() 重新启动后能再次响应关停调用
+            shuttingDown = false;
             getInstance().init();
         }
     }

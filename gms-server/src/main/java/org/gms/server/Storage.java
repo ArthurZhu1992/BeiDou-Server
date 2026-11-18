@@ -18,6 +18,9 @@
  */
 package org.gms.server;
 
+import org.gms.client.snapshot.CharacterSnapshot;
+import org.gms.client.snapshot.SnapshotCodecs;
+
 import org.gms.client.Client;
 import org.gms.client.inventory.InventoryType;
 import org.gms.client.inventory.Item;
@@ -31,6 +34,7 @@ import org.gms.provider.DataProviderFactory;
 import org.gms.provider.DataTool;
 import org.gms.provider.wz.WZFiles;
 import org.gms.util.DatabaseConnection;
+import org.gms.util.I18nUtil;
 import org.gms.util.PacketCreator;
 import org.gms.util.Pair;
 
@@ -231,7 +235,7 @@ public class Storage {
 
     public void sendStorage(Client c, int npcId) {
         if (c.getPlayer().getLevel() < 15) {
-            c.getPlayer().dropMessage(1, "15级以后才可以使用仓库服务");
+            c.getPlayer().dropMessage(1, I18nUtil.getMessage("Storage.message1"));
             c.sendPacket(PacketCreator.enableActions());
             return;
         }
@@ -363,4 +367,21 @@ public class Storage {
         }
     }
 
+
+    public CharacterSnapshot.StorageInfo toSnapshot() {
+        lock.lock();
+        try {
+            CharacterSnapshot.StorageInfo snapshot = new CharacterSnapshot.StorageInfo();
+            snapshot.storageid = id;
+            snapshot.slots = slots;
+            snapshot.meso = meso;
+            snapshot.items = new ArrayList<>();
+            for (Item item : items) {
+                snapshot.items.add(SnapshotCodecs.encodeItem(item, item.getInventoryType().getType()));
+            }
+            return snapshot;
+        } finally {
+            lock.unlock();
+        }
+    }
 }

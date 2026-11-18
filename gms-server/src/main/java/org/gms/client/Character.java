@@ -25,6 +25,9 @@ package org.gms.client;
 import lombok.Getter;
 import lombok.Setter;
 import org.gms.client.autoban.AutobanManager;
+import org.gms.client.snapshot.CharacterSnapshot;
+import org.gms.client.snapshot.SnapshotCodecs;
+import java.util.concurrent.CompletableFuture;
 import org.gms.client.creator.CharacterFactoryRecipe;
 import org.gms.client.inventory.*;
 import org.gms.client.inventory.Equip.StatUpgrade;
@@ -47,6 +50,8 @@ import org.gms.constants.string.ExtendKey;
 import org.gms.constants.string.ExtendType;
 import org.gms.dao.entity.*;
 import org.gms.exception.NotEnabledException;
+import org.gms.exception.BizException;
+import org.gms.exception.BizExceptionEnum;
 import org.gms.manager.ServerManager;
 import org.gms.model.dto.InventorySearchReqDTO;
 import org.gms.model.dto.InventorySearchRtnDTO;
@@ -62,7 +67,6 @@ import org.gms.net.server.guild.Guild;
 import org.gms.net.server.guild.GuildCharacter;
 import org.gms.net.server.guild.GuildPackets;
 import org.gms.net.server.services.task.world.CharacterSaveService;
-import org.gms.net.server.services.type.WorldServices;
 import org.gms.net.server.world.*;
 import org.gms.scripting.AbstractPlayerInteraction;
 import org.gms.scripting.event.EventInstanceManager;
@@ -83,6 +87,7 @@ import org.gms.server.partyquest.MonsterCarnival;
 import org.gms.server.partyquest.MonsterCarnivalParty;
 import org.gms.server.partyquest.PartyQuest;
 import org.gms.server.quest.Quest;
+import org.gms.server.quest.medal.DynamicHairMedal;
 import org.gms.service.*;
 import org.gms.util.*;
 import org.gms.util.packets.WeddingPackets;
@@ -103,6 +108,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.IntPredicate;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -138,7 +144,6 @@ public class Character extends AbstractCharacterObject {
     @Setter
     @Getter
     private int gender;
-    @Setter
     @Getter
     private int hair;
     @Setter
@@ -268,7 +273,8 @@ public class Character extends AbstractCharacterObject {
     @Getter
     @Setter
     private boolean finishedDojoTutorial;
-    private boolean usedStorage = false;
+    private final AtomicLong storageChangeVersion = new AtomicLong();
+    private final AtomicLong savedStorageVersion = new AtomicLong();
     @Getter
     @Setter
     private String name;
@@ -462,6 +468,7 @@ public class Character extends AbstractCharacterObject {
     @Getter
     private boolean useCS;  //chaos scroll upon crafting item.
     private long npcCd;
+    private final Lock mapWarpLock = new ReentrantLock();
     private int newWarpMap = -1;
     private boolean canWarpMap = true;  //only one "warp" must be used per call, and this will define the right one.
     private int canWarpCounter = 0;     //counts how many times "inner warps" have been called.
@@ -554,6 +561,12 @@ public class Character extends AbstractCharacterObject {
 
     public Job getJobStyle(byte opt) {
         return Job.getJobStyleInternal(this.getJob().getId(), opt);
+    }
+
+    public void setHair(int hair) {
+        int oldHair = this.hair;
+        this.hair = hair;
+        DynamicHairMedal.onHairChanged(this, oldHair, hair);
     }
 
     public Job getJobStyle() {
@@ -873,7 +886,14 @@ public class Character extends AbstractCharacterObject {
         allowExpGain = !allowExpGain;
     }
 
-    public void newClient(Client c) {
+    public synchronized void newClient(Client c) {
+        Client previous = this.client;
+        if (previous.isInMemoryTransition()) {
+            c.acquireMigratingCharacterSession(previous, this);
+        } else {
+            if (saveForSessionHandoff() != SaveResult.SAVED) throw new BizException(BizExceptionEnum.CHARACTER_SAVE_UNAVAILABLE);
+            c.acquireCharacterSaveSession(accountId, id);
+        }
         this.loggedIn = true;
         c.setAccountName(this.client.getAccountName());//No null's for accountName
         this.setClient(c);
@@ -882,6 +902,7 @@ public class Character extends AbstractCharacterObject {
         if (portal == null) {
             portal = map.getPortal(0);
         }
+        if (portal == null) throw new BizException(BizExceptionEnum.CHARACTER_SAVE_UNAVAILABLE);
         this.setPosition(portal.getPosition());
         this.initialSpawnPoint = portal.getId();
     }
@@ -1410,73 +1431,97 @@ public class Character extends AbstractCharacterObject {
     }
 
     public void changeMap(final MapleMap target, Portal pto) {
-        canWarpCounter++;
-
-        eventChangedMap(target.getId());    // player can be dropped from an event here, hence the new warping target.  //玩家可以从这里的事件中退出，因此成为新的扭曲目标。
-        MapleMap to = getWarpMap(target.getId());
-        if (pto == null) {
-            pto = to.getPortal(0);
+        // 不等待其他线程的换图，避免与事件脚本锁反序；同线程的嵌套换图可重入。
+        if (!mapWarpLock.tryLock()) {
+            return;
         }
-        changeMapInternal(to, pto.getPosition(), PacketCreator.getWarpToMap(to, pto.getId(), this));
-        canWarpMap = false;
+        try {
+            canWarpCounter++;
 
-        canWarpCounter--;
-        if (canWarpCounter == 0) {
-            canWarpMap = true;
+            eventChangedMap(target.getId());    // player can be dropped from an event here, hence the new warping target.  //玩家可以从这里的事件中退出，因此成为新的扭曲目标。
+            MapleMap to = getWarpMap(target.getId());
+            if (pto == null) {
+                pto = to.getPortal(0);
+            }
+            changeMapInternal(to, pto.getPosition(), pto.getId(), false);
+            canWarpMap = false;
+
+            canWarpCounter--;
+            if (canWarpCounter == 0) {
+                canWarpMap = true;
+            }
+
+            eventAfterChangedMap(this.getMapId());
+        } finally {
+            mapWarpLock.unlock();
         }
-
-        eventAfterChangedMap(this.getMapId());
     }
 
     public void changeMap(final MapleMap target, final Point pos) {
-        canWarpCounter++;
-
-        eventChangedMap(target.getId());
-        MapleMap to = getWarpMap(target.getId());
-        changeMapInternal(to, pos, PacketCreator.getWarpToMap(to, 0x80, pos, this));
-        canWarpMap = false;
-
-        canWarpCounter--;
-        if (canWarpCounter == 0) {
-            canWarpMap = true;
+        // 不等待其他线程的换图，避免与事件脚本锁反序；同线程的嵌套换图可重入。
+        if (!mapWarpLock.tryLock()) {
+            return;
         }
+        try {
+            canWarpCounter++;
 
-        eventAfterChangedMap(this.getMapId());
+            eventChangedMap(target.getId());
+            MapleMap to = getWarpMap(target.getId());
+            changeMapInternal(to, pos, 0x80, true);
+            canWarpMap = false;
+
+            canWarpCounter--;
+            if (canWarpCounter == 0) {
+                canWarpMap = true;
+            }
+
+            eventAfterChangedMap(this.getMapId());
+        } finally {
+            mapWarpLock.unlock();
+        }
     }
 
     public void forceChangeMap(final MapleMap target, Portal pto) {
-        // will actually enter the map given as parameter, regardless of being an eventmap or whatnot       //将实际输入作为参数给出的映射，无论是事件映射还是其他什么
+        // 不等待其他线程的换图，避免与事件脚本锁反序；同线程的嵌套换图可重入。
+        if (!mapWarpLock.tryLock()) {
+            return;
+        }
+        try {
+            // will actually enter the map given as parameter, regardless of being an eventmap or whatnot       //将实际输入作为参数给出的映射，无论是事件映射还是其他什么
 
-        canWarpCounter++;
-        eventChangedMap(MapId.NONE);
+            canWarpCounter++;
+            eventChangedMap(MapId.NONE);
 
-        EventInstanceManager mapEim = target.getEventInstance();
-        if (mapEim != null) {
-            EventInstanceManager playerEim = this.getEventInstance();
-            if (playerEim != null) {
-                playerEim.exitPlayer(this);
-                if (playerEim.getPlayerCount() == 0) {
-                    playerEim.dispose();
+            EventInstanceManager mapEim = target.getEventInstance();
+            if (mapEim != null) {
+                EventInstanceManager playerEim = this.getEventInstance();
+                if (playerEim != null) {
+                    playerEim.exitPlayer(this);
+                    if (playerEim.getPlayerCount() == 0) {
+                        playerEim.dispose();
+                    }
                 }
+
+                // thanks Thora for finding an issue with players not being actually warped into the target event map (rather sent to the event starting map)
+                //感谢Thora发现玩家实际上没有被扭曲到目标事件地图中（而是被发送到事件开始地图）的问题
+                mapEim.registerPlayer(this, false);
             }
 
-            // thanks Thora for finding an issue with players not being actually warped into the target event map (rather sent to the event starting map)
-            //感谢Thora发现玩家实际上没有被扭曲到目标事件地图中（而是被发送到事件开始地图）的问题
-            mapEim.registerPlayer(this, false);
-        }
+            if (pto == null) {
+                pto = target.getPortal(0);
+            }
+            changeMapInternal(target, pto.getPosition(), pto.getId(), false);
+            canWarpMap = false;
 
-        if (pto == null) {
-            pto = target.getPortal(0);
-        }
-        changeMapInternal(target, pto.getPosition(), PacketCreator.getWarpToMap(target, pto.getId(), this));
-        canWarpMap = false;
+            canWarpCounter--;
+            if (canWarpCounter == 0) {
+                canWarpMap = true;
+            }
 
-        canWarpCounter--;
-        if (canWarpCounter == 0) {
-            canWarpMap = true;
+            eventAfterChangedMap(this.getMapId());
+        } finally {
+            mapWarpLock.unlock();
         }
-
-        eventAfterChangedMap(this.getMapId());
     }
 
     private boolean buffMapProtection() {
@@ -1724,9 +1769,10 @@ public class Character extends AbstractCharacterObject {
      * 玩家更改地图 内部方法
      * @param to
      * @param pos
-     * @param warpPacket
+     * @param spawnPortal 出生传送点编号
+     * @param explicitPosition 是否在换图包中指定坐标
      */
-    private void changeMapInternal(final MapleMap to, final Point pos, Packet warpPacket) {
+    private void changeMapInternal(final MapleMap to, final Point pos, int spawnPortal, boolean explicitPosition) {
         if (!canWarpMap) {
             return;
         }
@@ -1747,12 +1793,19 @@ public class Character extends AbstractCharacterObject {
         }
         final Party k = e;
 
-        sendPacket(warpPacket);
+        Client warpClient = client;
+        int movementGeneration = warpClient.beginFieldMovementTransition();
+        int fieldKey = movementGeneration & 0xFF;
+        Packet warpPacket = explicitPosition
+                ? PacketCreator.getWarpToMap(to, spawnPortal, pos, this, fieldKey)
+                : PacketCreator.getWarpToMap(to, spawnPortal, this, fieldKey);
+        warpClient.sendPacket(warpPacket);
         map.removePlayer(this);
         if (client.getChannelServer().getPlayerStorage().getCharacterById(getId()) != null) {
             map = to;
             setPosition(pos);
             map.addPlayer(this);
+            warpClient.finishFieldMovementTransition(movementGeneration);
             visitMap(map);
 
             prtLock.lock();
@@ -2004,9 +2057,20 @@ public class Character extends AbstractCharacterObject {
         }
 
         if (ob instanceof MapItem mapitem) {
-            if (System.currentTimeMillis() - mapitem.getDropTime() < 400 || !mapitem.canBePickedBy(this)) {
+            if (System.currentTimeMillis() - mapitem.getDropTime() < 400) {
                 enableActions();
                 return;
+            }
+
+            // canBePickedBy 读/写 owner 字段,必须持 itemLock
+            mapitem.lockItem();
+            try {
+                if (!mapitem.canBePickedBy(this)) {
+                    enableActions();
+                    return;
+                }
+            } finally {
+                mapitem.unlockItem();
             }
 
             List<Character> mpcs = new LinkedList<>();
@@ -2421,7 +2485,7 @@ public class Character extends AbstractCharacterObject {
         try {
             Server.getInstance().disbandGuild(guildId);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error(I18nUtil.getLogMessage("Character.disbandGuild.error1"), id, name, guildId, e);
         }
     }
 
@@ -3099,6 +3163,60 @@ public class Character extends AbstractCharacterObject {
         }
     }
 
+    /**
+     * 将金币扣除与调用方的数据库事务绑定。
+     * 角色保存与其他金币变更在事务完成前都会等待，
+     * 只有持久化成功后才发布新的内存余额。
+     *
+     * @param cost        需要扣除的正整数金币
+     * @param persistence 接收扣费后余额，并在同一事务中持久化业务与金币
+     * @return 事务和内存扣费是否均成功
+     */
+    public synchronized boolean spendMesoTransactionally(int cost, IntPredicate persistence) {
+        if (cost <= 0) {
+            return false;
+        }
+        // 联盟创建/扩容直接提交金币事务。先排空旧快照，再在角色 monitor 内执行业务，
+        // 防止已排队的旧余额覆盖已提交扣费；基线等待必须早于 petLock。
+        if (!saveCharToDB(true)) {
+            return false;
+        }
+
+        int balanceAfter;
+        petLock.lock();
+        try {
+            int currentBalance = meso.get();
+            if (currentBalance < cost) {
+                return false;
+            }
+
+            balanceAfter = currentBalance - cost;
+            boolean persisted;
+            try {
+                persisted = persistence.test(balanceAfter);
+            } catch (RuntimeException e) {
+                log.error(I18nUtil.getLogMessage("Character.spendMesoTransactionally.error1"),
+                        id, cost, e);
+                return false;
+            }
+            if (!persisted) {
+                return false;
+            }
+            meso.set(balanceAfter);
+        } finally {
+            petLock.unlock();
+        }
+
+        try {
+            updateSingleStat(Stat.MESO, balanceAfter, false);
+            sendPacket(PacketCreator.getShowMesoGain(-cost, true));
+        } catch (RuntimeException e) {
+            log.error(I18nUtil.getLogMessage("Character.spendMesoTransactionally.error2"),
+                    id, cost, e);
+        }
+        return true;
+    }
+
     public void genericGuildMessage(int code) {
         this.sendPacket(GuildPackets.genericGuildMessage((byte) code));
     }
@@ -3395,6 +3513,8 @@ public class Character extends AbstractCharacterObject {
 
     public void cancelAllBuffs(boolean softcancel) {
         if (softcancel) {
+            // cancelEffectFromBuffStat 会重入 cancelEffect，外层也须按 prtLock -> effLock -> chrLock 取锁。
+            prtLock.lock();
             effLock.lock();
             chrLock.lock();
             try {
@@ -3410,6 +3530,7 @@ public class Character extends AbstractCharacterObject {
             } finally {
                 chrLock.unlock();
                 effLock.unlock();
+                prtLock.unlock();
             }
         } else {
             Map<StatEffect, Long> mseBuffs = new LinkedHashMap<>();
@@ -3589,31 +3710,38 @@ public class Character extends AbstractCharacterObject {
     }
 
     public void updateActiveEffects() {
-        effLock.lock();     // thanks davidlafriniere, maple006, RedHat for pointing a deadlock occurring here
+        // isUpdatingEffect -> StatEffect.isActive 会读取同图队友，必须与 cancelEffect、
+        // updateLocalStats 保持 prtLock -> effLock 顺序，避免切图与技能处理互相等待。
+        prtLock.lock();
         try {
-            Set<BuffStat> updatedBuffs = new LinkedHashSet<>();
-            Set<StatEffect> activeEffects = new LinkedHashSet<>();
+            effLock.lock();
+            try {
+                Set<BuffStat> updatedBuffs = new LinkedHashSet<>();
+                Set<StatEffect> activeEffects = new LinkedHashSet<>();
 
-            for (BuffStatValueHolder mse : effects.values()) {
-                activeEffects.add(mse.effect);
-            }
+                for (BuffStatValueHolder mse : effects.values()) {
+                    activeEffects.add(mse.effect);
+                }
 
-            for (Map<BuffStat, BuffStatValueHolder> buff : buffEffects.values()) {
-                StatEffect mse = getEffectFromBuffSource(buff);
-                if (isUpdatingEffect(activeEffects, mse)) {
-                    for (Pair<BuffStat, Integer> p : mse.getStatups()) {
-                        updatedBuffs.add(p.getLeft());
+                for (Map<BuffStat, BuffStatValueHolder> buff : buffEffects.values()) {
+                    StatEffect mse = getEffectFromBuffSource(buff);
+                    if (isUpdatingEffect(activeEffects, mse)) {
+                        for (Pair<BuffStat, Integer> p : mse.getStatups()) {
+                            updatedBuffs.add(p.getLeft());
+                        }
                     }
                 }
-            }
 
-            for (BuffStat mbs : updatedBuffs) {
-                effects.remove(mbs);
-            }
+                for (BuffStat mbs : updatedBuffs) {
+                    effects.remove(mbs);
+                }
 
-            updateEffects(updatedBuffs);
+                updateEffects(updatedBuffs);
+            } finally {
+                effLock.unlock();
+            }
         } finally {
-            effLock.unlock();
+            prtLock.unlock();
         }
     }
 
@@ -3700,6 +3828,8 @@ public class Character extends AbstractCharacterObject {
     }
 
     public void cancelBuffStats(BuffStat stat) {
+        // dropBuffStats 选择备用效果时会读取同图队友，与 cancelEffect 保持相同取锁顺序。
+        prtLock.lock();
         effLock.lock();
         try {
             List<Pair<Integer, BuffStatValueHolder>> cancelList = new LinkedList<>();
@@ -3724,6 +3854,7 @@ public class Character extends AbstractCharacterObject {
             }
         } finally {
             effLock.unlock();
+            prtLock.unlock();
         }
 
         cancelPlayerBuffs(Collections.singletonList(stat));
@@ -4334,8 +4465,10 @@ public class Character extends AbstractCharacterObject {
     }
 
     public List<Ring> getCrushRings() {
-        Collections.sort(crushRings);
-        return crushRings;
+        synchronized (crushRings) {
+            Collections.sort(crushRings);
+            return new ArrayList<>(crushRings);
+        }
     }
 
     public Collection<Door> getDoors() {
@@ -4709,12 +4842,14 @@ public class Character extends AbstractCharacterObject {
     }
 
     public void setUsedStorage() {
-        usedStorage = true;
+        storageChangeVersion.incrementAndGet();
     }
 
     public List<Ring> getFriendshipRings() {
-        Collections.sort(friendshipRings);
-        return friendshipRings;
+        synchronized (friendshipRings) {
+            Collections.sort(friendshipRings);
+            return new ArrayList<>(friendshipRings);
+        }
     }
 
     public boolean isMale() {
@@ -5177,6 +5312,17 @@ public class Character extends AbstractCharacterObject {
             return;
         }
 
+        if (merchant.isClosedForBan()) {
+            merchant.closeForBan();
+            this.setHiredMerchant(null);
+            return;
+        }
+
+        if (merchant.isOwner(this) && !merchant.isPublished()) {
+            merchant.closeOwnerMerchant(this);
+            return;
+        }
+
         if (closeMerchant) {
             if (merchant.isOwner(this) && merchant.getItems().isEmpty()) {
                 merchant.forceClose();
@@ -5186,7 +5332,10 @@ public class Character extends AbstractCharacterObject {
             }
         } else {
             if (merchant.isOwner(this)) {
-                merchant.setOpen(true);
+                if (!merchant.setOpen(true)) {
+                    merchant.closeForBan();
+                    return;
+                }
             } else {
                 merchant.removeVisitor(this);
             }
@@ -5544,8 +5693,9 @@ public class Character extends AbstractCharacterObject {
             sendPacket(PacketCreator.giveBuff(energyBar, 0, stat));
             sendPacket(PacketCreator.showOwnBuffEffect(energycharge.getId(), 2));
             getMap().broadcastPacket(this, PacketCreator.showBuffEffect(id, energycharge.getId(), 2));
+            // 海盗状态封包的时长单位为秒，StatEffect 内部使用毫秒。
             getMap().broadcastPacket(this, PacketCreator.giveForeignPirateBuff(id, energycharge.getId(),
-                    ceffect.getDuration(), stat));
+                    ceffect.getDuration() / 1000, stat));
         }
         if (energyBar >= 10000 && energyBar < 11000) {
             energyBar = 15000;
@@ -6061,42 +6211,47 @@ public class Character extends AbstractCharacterObject {
     }
 
     public void setCouponRates() {
-        List<Integer> couponEffects;
-
-        Collection<Item> cashItems = this.getInventory(InventoryType.CASH).list();
-        chrLock.lock();
-        try {
-            setActiveCoupons(cashItems);
-            couponEffects = activateCouponsEffects();
-        } finally {
-            chrLock.unlock();
-        }
-
-        for (Integer couponId : couponEffects) {
-            commitBuffCoupon(couponId);
-        }
-    }
-
-    private void revertCouponRates() {
-        revertCouponsEffects();
+        refreshCouponRates(false);
     }
 
     public void updateCouponRates() {
+        refreshCouponRates(true);
+    }
+
+    private void refreshCouponRates(boolean replaceExisting) {
         Inventory cashInv = this.getInventory(InventoryType.CASH);
         if (cashInv == null) {
             return;
         }
 
+        // 与 Buff 到期取消保持相同锁序。
+        prtLock.lock();
         effLock.lock();
-        chrLock.lock();
-        cashInv.lockInventory();
         try {
-            revertCouponRates();
-            setCouponRates();
+            if (replaceExisting) {
+                dispelBuffCoupons();
+            }
+
+            // list() 取完快照就释放现金背包锁，属性重算可能读取消耗背包。
+            Collection<Item> cashItems = cashInv.list();
+            List<Integer> couponEffects;
+            chrLock.lock();
+            try {
+                if (replaceExisting) {
+                    revertCouponRates();
+                }
+                setActiveCoupons(cashItems);
+                couponEffects = activateCouponsEffects();
+            } finally {
+                chrLock.unlock();
+            }
+
+            for (Integer couponId : couponEffects) {
+                commitBuffCoupon(couponId);
+            }
         } finally {
-            cashInv.unlockInventory();
-            chrLock.unlock();
             effLock.unlock();
+            prtLock.unlock();
         }
     }
 
@@ -6123,9 +6278,7 @@ public class Character extends AbstractCharacterObject {
         this.mesoCoupon *= (getCouponMultiplier(couponId) * couponQty);
     }
 
-    private void revertCouponsEffects() {
-        dispelBuffCoupons();
-
+    private void revertCouponRates() {
         this.expRate /= this.expCoupon;
         this.dropRate /= this.dropCoupon;
         this.mesoRate /= this.mesoCoupon;
@@ -6247,9 +6400,13 @@ public class Character extends AbstractCharacterObject {
         if (ItemId.isWeddingRing(ringItemId)) {
             this.marriageRing = ring;
         } else if (ring.getItemId() > 1112012) {
-            this.friendshipRings.add(ring);
+            synchronized (friendshipRings) {
+                this.friendshipRings.add(ring);
+            }
         } else {
-            this.crushRings.add(ring);
+            synchronized (crushRings) {
+                this.crushRings.add(ring);
+            }
         }
     }
 
@@ -6637,12 +6794,23 @@ public class Character extends AbstractCharacterObject {
     }
 
     public static Character loadCharFromDB(final int cid, Client client, boolean channelServer) {
+        boolean loaded = false;
         try {
-            return characterService.loadCharFromDB(cid, client, channelServer);
-        } catch (Exception e) {
-            log.error(I18nUtil.getLogMessage("Character.loadCharFromDB.error1"), cid, e);
+            if (channelServer) {
+                CharactersDO stored = characterService.findById(cid);
+                if (stored == null) return null;
+                client.setAccID(stored.getAccountid());
+                client.acquireCharacterSaveSession(stored.getAccountid(), cid);
+            }
+            Character result = characterService.loadCharFromDB(cid, client, channelServer);
+            loaded = result != null;
+            return result;
+        } catch (Exception failure) {
+            log.error(I18nUtil.getLogMessage("Character.loadCharFromDB.error1"), cid, failure);
+            return null;
+        } finally {
+            if (channelServer && !loaded) CharacterSaveService.getInstance().abandonLoad(client.getCharacterSaveSession());
         }
-        return null;
     }
 
     public void reloadQuestExpirations() {
@@ -7124,15 +7292,12 @@ public class Character extends AbstractCharacterObject {
     }
 
     public void receivePartyMemberHP() {
-        prtLock.lock();
-        try {
-            if (party != null) {
-                for (Character partychar : this.getPartyMembersOnSameMap()) {
-                    sendPacket(PacketCreator.updatePartyMemberHP(partychar.getId(), partychar.getHp(), partychar.getCurrentMaxHp()));
-                }
-            }
-        } finally {
-            prtLock.unlock();
+        // 不在此处包一层 prtLock:getPartyMembersOnSameMap 内部已持 prtLock 保护 party 引用。
+        // 若再包一层,会在持 prtLock 的同时对同图队友逐个取 getHp()(对方 statRlock),
+        // 与 updateLocalStats(本角色 statWlock 后再 updatePartyMemberHP 取 prtLock)形成
+        // 跨角色反向锁顺序,存在死锁窗口。
+        for (Character partychar : this.getPartyMembersOnSameMap()) {
+            sendPacket(PacketCreator.updatePartyMemberHP(partychar.getId(), partychar.getHp(), partychar.getCurrentMaxHp()));
         }
     }
 
@@ -7512,409 +7677,447 @@ public class Character extends AbstractCharacterObject {
         return false;
     }
 
+    public enum SaveResult { SAVED, DISCARDED, FAILED }
+
+    private int finalSnapshotFailures;
+
     public void saveCharToDB() {
-        if (GameConfig.getServerBoolean("use_autosave")) {
-            Runnable r = () -> saveCharToDB(true);
+        CompletableFuture<SaveResult> completion = requestCharacterSave(true, false);
+        if (!GameConfig.getServerBoolean("use_autosave")) completion.join();
+    }
 
-            CharacterSaveService service = getCharacterSaveService();
-            service.registerSaveCharacter(this.getId(), r);
-        } else {
-            saveCharToDB(true);
+    /** 兼容旧入口；业务同步保存一律按实时优先级排队。 */
+    public boolean saveCharToDB(boolean notAutosave) {
+        return requestCharacterSave(true, false).join() == SaveResult.SAVED;
+    }
+
+    public CompletableFuture<SaveResult> requestAutosave() {
+        return requestCharacterSave(false, false);
+    }
+
+    public SaveResult saveForSessionHandoff() {
+        return requestCharacterSave(true, true).join();
+    }
+
+    /** 同世界迁移复用在线 Character；只要求原会话已封口，后继写入仍排在其后。 */
+    public synchronized boolean prepareSaveForMigration() {
+        requestCharacterSave(true, true);
+        return client != null && client.getCharacterSaveSession() != null
+                && CharacterSaveService.getInstance().isClosing(client.getCharacterSaveSession());
+    }
+
+    private synchronized CompletableFuture<SaveResult> requestCharacterSave(boolean realtime, boolean terminal) {
+        Client owner = client;
+        if (owner == null || owner.getCharacterSaveSession() == null) {
+            return CompletableFuture.completedFuture(terminal && ++finalSnapshotFailures >= 3 ? SaveResult.DISCARDED : SaveResult.FAILED);
+        }
+        CharacterSaveService service = CharacterSaveService.getInstance();
+        CharacterSaveService.Session session = owner.getCharacterSaveSession();
+        if (service.isClosing(session)) {
+            return terminal ? service.retryFinal(session) : CompletableFuture.completedFuture(SaveResult.DISCARDED);
+        }
+        try {
+            if (!loggedIn) return CompletableFuture.completedFuture(SaveResult.FAILED);
+            CharacterSnapshot snapshot = captureSaveSnapshot();
+            List<FamilyEntry> offlineSeniors = new ArrayList<>();
+            FamilyEntry entry = getFamilyEntry();
+            FamilyEntry senior = entry == null ? null : entry.getSenior();
+            for (int i = 0; i < 2 && senior != null && senior.getChr() == null; i++, senior = senior.getSenior()) {
+                offlineSeniors.add(senior);
+            }
+            PendingCharacterSave pending = new PendingCharacterSave(snapshot, session, List.copyOf(offlineSeniors));
+            CompletableFuture<SaveResult> result = service.submit(session, realtime, terminal,
+                    terminal ? finalSnapshotFailures : 0, pending::persist, pending::release);
+            finalSnapshotFailures = 0;
+            return result;
+        } catch (Throwable failure) {
+            log.error(I18nUtil.getLogMessage("CharacterSave.snapshotFailed"), id, owner.getSessionId(), failure);
+            if (terminal && ++finalSnapshotFailures >= CharacterSaveService.MAX_SAVE_ATTEMPTS) {
+                return service.submit(session, true, true, finalSnapshotFailures, () -> SaveResult.DISCARDED, () -> {});
+            }
+            return CompletableFuture.completedFuture(SaveResult.FAILED);
         }
     }
 
-    private CharacterSaveService getCharacterSaveService() {
-        return (CharacterSaveService) getWorldServer().getServiceAccess(WorldServices.SAVE_CHARACTER);
-    }
+    private final class PendingCharacterSave {
+        private final CharacterSnapshot snapshot;
+        private final CharacterSaveService.Session session;
+        private final List<FamilyEntry> offlineSeniors;
+        private boolean committed;
 
-    //ItemFactory saveItems and monsterbook.saveCards are the most time consuming here.
-    public synchronized void saveCharToDB(boolean notAutosave) {
-        if (!loggedIn) {
-            // 如果已经退出登录，取消自动保存当前角色任务
-            CharacterSaveService service = getCharacterSaveService();
-            service.unregisterSaveCharacter(this.getId());
-            return;
+        private PendingCharacterSave(CharacterSnapshot snapshot, CharacterSaveService.Session session, List<FamilyEntry> offlineSeniors) {
+            this.snapshot = snapshot;
+            this.session = session;
+            this.offlineSeniors = offlineSeniors;
         }
 
-        log.info(I18nUtil.getLogMessage(notAutosave ? "Character.saveCharToDB.info1" : "Character.saveCharToDB.info2"), name);
-
-        Server.getInstance().updateCharacterEntry(this);
-
-        try (Connection con = DatabaseConnection.getConnection()) {
-            con.setAutoCommit(false);
-            con.setTransactionIsolation(Connection.TRANSACTION_READ_UNCOMMITTED);
-
-            try {
-                try (PreparedStatement ps = con.prepareStatement("UPDATE characters SET level = ?, fame = ?, str = ?, dex = ?, luk = ?, `int` = ?, exp = ?, gachaexp = ?, hp = ?, mp = ?, maxhp = ?, maxmp = ?, sp = ?, ap = ?, gm = ?, skincolor = ?, gender = ?, job = ?, hair = ?, face = ?, map = ?, meso = ?, hpMpUsed = ?, spawnpoint = ?, party = ?, buddyCapacity = ?, messengerid = ?, messengerposition = ?, mountlevel = ?, mountexp = ?, mounttiredness= ?, equipslots = ?, useslots = ?, setupslots = ?, etcslots = ?,  monsterbookcover = ?, vanquisherStage = ?, dojoPoints = ?, lastDojoStage = ?, finishedDojoTutorial = ?, vanquisherKills = ?, matchcardwins = ?, matchcardlosses = ?, matchcardties = ?, omokwins = ?, omoklosses = ?, omokties = ?, dataString = ?, fquest = ?, jailexpire = ?, partnerId = ?, marriageItemId = ?, lastExpGainTime = ?, ariantPoints = ?, partySearch = ? WHERE id = ?", Statement.RETURN_GENERATED_KEYS)) {
-                    ps.setInt(1, level);    // thanks CanIGetaPR for noticing an unnecessary "level" limitation when persisting DB data
-                    ps.setInt(2, fame);
-
-                    effLock.lock();
-                    statWlock.lock();
-                    try {
-                        ps.setInt(3, attrStr);
-                        ps.setInt(4, attrDex);
-                        ps.setInt(5, attrLuk);
-                        ps.setInt(6, attrInt);
-                        ps.setInt(7, Math.abs(exp.get()));
-                        ps.setInt(8, Math.abs(gachaExp.get()));
-                        ps.setInt(9, hp);
-                        ps.setInt(10, mp);
-                        ps.setInt(11, maxHp);
-                        ps.setInt(12, maxMp);
-
-                        StringBuilder sps = new StringBuilder();
-                        for (int j : remainingSp) {
-                            sps.append(j);
-                            sps.append(",");
-                        }
-                        String sp = sps.toString();
-                        ps.setString(13, sp.substring(0, sp.length() - 1));
-
-                        ps.setInt(14, remainingAp);
-                    } finally {
-                        statWlock.unlock();
-                        effLock.unlock();
-                    }
-
-                    ps.setInt(15, gmLevel);
-                    ps.setInt(16, skinColor.getId());
-                    ps.setInt(17, gender);
-                    ps.setInt(18, job.getId());
-                    ps.setInt(19, hair);
-                    ps.setInt(20, face);
-                    if (map == null || (cashShop != null && cashShop.isOpened())) {
-                        ps.setInt(21, mapId);
-                    } else {
-                        if (map.getForcedReturnId() != MapId.NONE) {
-                            ps.setInt(21, map.getForcedReturnId());
-                        } else {
-                            ps.setInt(21, getHp() < 1 ? map.getReturnMapId() : map.getId());
-                        }
-                    }
-                    ps.setInt(22, meso.get());
-                    ps.setInt(23, hpMpApUsed);
-                    if (map == null || map.getId() == MapId.CRIMSONWOOD_VALLEY_1 || map.getId() == MapId.CRIMSONWOOD_VALLEY_2) {  // reset to first spawnpoint on those maps
-                        ps.setInt(24, 0);
-                    } else {
-                        Portal closest = map.findClosestPlayerSpawnpoint(getPosition());
-                        if (closest != null) {
-                            ps.setInt(24, closest.getId());
-                        } else {
-                            ps.setInt(24, 0);
-                        }
-                    }
-
-                    prtLock.lock();
-                    try {
-                        if (party != null) {
-                            ps.setInt(25, party.getId());
-                        } else {
-                            ps.setInt(25, -1);
-                        }
-                    } finally {
-                        prtLock.unlock();
-                    }
-
-                    ps.setInt(26, buddylist.getCapacity());
-                    if (messenger != null) {
-                        ps.setInt(27, messenger.getId());
-                        ps.setInt(28, messengerPosition);
-                    } else {
-                        ps.setInt(27, 0);
-                        ps.setInt(28, 4);
-                    }
-                    if (mapleMount != null) {
-                        ps.setInt(29, mapleMount.getLevel());
-                        ps.setInt(30, mapleMount.getExp());
-                        ps.setInt(31, mapleMount.getTiredness());
-                    } else {
-                        ps.setInt(29, 1);
-                        ps.setInt(30, 0);
-                        ps.setInt(31, 0);
-                    }
-                    for (int i = 1; i < 5; i++) {
-                        ps.setInt(i + 31, getSlots(i));
-                    }
-
-                    monsterBook.saveCards(con, id);
-
-                    ps.setInt(36, bookCover);
-                    ps.setInt(37, vanquisherStage);
-                    ps.setInt(38, dojoPoints);
-                    ps.setInt(39, dojoStage);
-                    ps.setInt(40, finishedDojoTutorial ? 1 : 0);
-                    ps.setInt(41, vanquisherKills);
-                    ps.setInt(42, matchcardwins);
-                    ps.setInt(43, matchcardlosses);
-                    ps.setInt(44, matchcardties);
-                    ps.setInt(45, omokwins);
-                    ps.setInt(46, omoklosses);
-                    ps.setInt(47, omokties);
-                    ps.setString(48, dataString);
-                    ps.setInt(49, questFame);
-                    ps.setLong(50, jailExpiration);
-                    ps.setInt(51, partnerId);
-                    ps.setInt(52, marriageItemId);
-                    ps.setTimestamp(53, new Timestamp(lastExpGainTime));
-                    ps.setInt(54, ariantPoints);
-                    ps.setBoolean(55, canRecvPartySearchInvite);
-                    ps.setInt(56, id);
-
-                    int updateRows = ps.executeUpdate();
-                    if (updateRows < 1) {
-                        throw new RuntimeException("Character not in database (" + id + ")");
-                    }
-                }
-
-                List<Pet> petList = new LinkedList<>();
-                petLock.lock();
+        private SaveResult persist() throws SQLException {
+            if (committed) return SaveResult.SAVED;
+            try (Connection con = DatabaseConnection.getConnection()) {
+                int previousTimeout = con.getNetworkTimeout();
+                int previousIsolation = con.getTransactionIsolation();
+                if (previousTimeout == 0 || previousTimeout > 60_000) con.setNetworkTimeout(Runnable::run, 60_000);
                 try {
-                    for (int i = 0; i < 3; i++) {
-                        if (pets[i] != null) {
-                            petList.add(pets[i]);
+                    con.setTransactionIsolation(Connection.TRANSACTION_READ_UNCOMMITTED);
+                    con.setAutoCommit(false);
+                    try {
+                        if (!CharacterSaveService.getInstance().isExecutingSession(session)) {
+                            throw new SQLException(I18nUtil.getExceptionMessage("CHARACTER_SAVE_UNAVAILABLE"));
                         }
+                        try (PreparedStatement ps = con.prepareStatement("SELECT loggedin FROM accounts WHERE id=? FOR UPDATE")) {
+                            ps.setInt(1, snapshot.accountId);
+                            try (ResultSet rows = ps.executeQuery()) {
+                                if (!rows.next() || rows.getInt(1) == Client.LOGIN_NOTLOGGEDIN) {
+                                    throw new SQLException(I18nUtil.getExceptionMessage("CHARACTER_SAVE_UNAVAILABLE"));
+                                }
+                            }
+                        }
+                        for (Pet pet : getPets()) if (pet != null) pet.saveToDbChecked(con);
+                        CharacterSnapshotService.save(con, snapshot);
+                        for (FamilyEntry senior : offlineSeniors) {
+                            if (!senior.saveReputation(con)) throw new SQLException(I18nUtil.getExceptionMessage("CHARACTER_SAVE_FAILED"));
+                        }
+                        con.commit();
+                        committed = true;
+                    } catch (Exception failure) {
+                        try { con.rollback(); } catch (SQLException rollbackFailure) { failure.addSuppressed(rollbackFailure); }
+                        throw failure;
                     }
                 } finally {
-                    petLock.unlock();
+                    try { con.setTransactionIsolation(previousIsolation); }
+                    catch (SQLException failure) { log.warn(I18nUtil.getLogMessage("CharacterSave.connectionCleanup"), snapshot.charId, failure); }
+                    try { con.setNetworkTimeout(Runnable::run, previousTimeout); }
+                    catch (SQLException failure) { log.warn(I18nUtil.getLogMessage("CharacterSave.connectionCleanup"), snapshot.charId, failure); }
                 }
-
-                for (Pet pet : petList) {
-                    pet.saveToDb();
-                }
-
-                // Key config
-                deleteWhereCharacterId(con, "DELETE FROM keymap WHERE characterid = ?");
-                try (PreparedStatement psKey = con.prepareStatement("INSERT INTO keymap (characterid, `key`, `type`, `action`) VALUES (?, ?, ?, ?)")) {
-                    psKey.setInt(1, id);
-
-                    Set<Entry<Integer, KeyBinding>> keybindingItems = Collections.unmodifiableSet(keymap.entrySet());
-                    for (Entry<Integer, KeyBinding> keybinding : keybindingItems) {
-                        psKey.setInt(2, keybinding.getKey());
-                        psKey.setInt(3, keybinding.getValue().getType());
-                        psKey.setInt(4, keybinding.getValue().getAction());
-                        psKey.addBatch();
-                    }
-                    psKey.executeBatch();
-                }
-
-                // No quickslots, or no change.
-                boolean bQuickslotEquals = this.quickSlotKeyMapped == null || (this.quickSlotLoaded != null && Arrays.equals(this.quickSlotKeyMapped.GetKeybindings(), this.quickSlotLoaded));
-                if (!bQuickslotEquals) {
-                    long nQuickslotKeymapped = NumberTool.BytesToLong(this.quickSlotKeyMapped.GetKeybindings());
-
-                    try (final PreparedStatement psQuick = con.prepareStatement("INSERT INTO quickslotkeymapped (accountid, keymap) VALUES (?, ?) ON DUPLICATE KEY UPDATE keymap = ?;")) {
-                        psQuick.setInt(1, this.getAccountId());
-                        psQuick.setLong(2, nQuickslotKeymapped);
-                        psQuick.setLong(3, nQuickslotKeymapped);
-                        psQuick.executeUpdate();
-                    }
-                }
-
-                // Skill macros
-                deleteWhereCharacterId(con, "DELETE FROM skillmacros WHERE characterid = ?");
-                try (PreparedStatement psMacro = con.prepareStatement("INSERT INTO skillmacros (characterid, skill1, skill2, skill3, name, shout, position) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
-                    psMacro.setInt(1, getId());
-                    for (int i = 0; i < 5; i++) {
-                        SkillMacro macro = skillMacros[i];
-                        if (macro != null) {
-                            psMacro.setInt(2, macro.getSkill1());
-                            psMacro.setInt(3, macro.getSkill2());
-                            psMacro.setInt(4, macro.getSkill3());
-                            psMacro.setString(5, macro.getName());
-                            psMacro.setInt(6, macro.getShout());
-                            psMacro.setInt(7, i);
-                            psMacro.addBatch();
-                        }
-                    }
-                    psMacro.executeBatch();
-                }
-
-                List<Pair<Item, InventoryType>> itemsWithType = new ArrayList<>();
-                for (Inventory iv : inventory) {
-                    for (Item item : iv.list()) {
-                        itemsWithType.add(new Pair<>(item, iv.getType()));
-                    }
-                }
-
-                // Items
-                ItemFactory.INVENTORY.saveItems(itemsWithType, id, con);
-
-                // Skills
-                try (PreparedStatement psSkill = con.prepareStatement("REPLACE INTO skills (characterid, skillid, skilllevel, masterlevel, expiration) VALUES (?, ?, ?, ?, ?)")) {
-                    psSkill.setInt(1, id);
-                    for (Entry<Skill, SkillEntry> skill : skills.entrySet()) {
-                        psSkill.setInt(2, skill.getKey().getId());
-                        psSkill.setInt(3, skill.getValue().skillLevel);
-                        psSkill.setInt(4, skill.getValue().masterLevel);
-                        psSkill.setLong(5, skill.getValue().expiration);
-                        psSkill.addBatch();
-                    }
-                    psSkill.executeBatch();
-                }
-
-                // Saved locations
-                deleteWhereCharacterId(con, "DELETE FROM savedlocations WHERE characterid = ?");
-                try (PreparedStatement psLoc = con.prepareStatement("INSERT INTO savedlocations (characterid, `locationtype`, `map`, `portal`) VALUES (?, ?, ?, ?)")) {
-                    psLoc.setInt(1, id);
-                    for (SavedLocationType savedLocationType : SavedLocationType.values()) {
-                        if (savedLocations[savedLocationType.ordinal()] != null) {
-                            psLoc.setString(2, savedLocationType.name());
-                            psLoc.setInt(3, savedLocations[savedLocationType.ordinal()].getMapId());
-                            psLoc.setInt(4, savedLocations[savedLocationType.ordinal()].getPortal());
-                            psLoc.addBatch();
-                        }
-                    }
-                    psLoc.executeBatch();
-                }
-
-                deleteWhereCharacterId(con, "DELETE FROM trocklocations WHERE characterid = ?");
-
-                // Vip teleport rocks
-                try (PreparedStatement psVip = con.prepareStatement("INSERT INTO trocklocations(characterid, mapid, vip) VALUES (?, ?, 0)")) {
-                    for (int i = 0; i < getTrockSize(); i++) {
-                        if (trockmaps.get(i) != MapId.NONE) {
-                            psVip.setInt(1, getId());
-                            psVip.setInt(2, trockmaps.get(i));
-                            psVip.addBatch();
-                        }
-                    }
-                    psVip.executeBatch();
-                }
-
-                // Regular teleport rocks
-                try (PreparedStatement psReg = con.prepareStatement("INSERT INTO trocklocations(characterid, mapid, vip) VALUES (?, ?, 1)")) {
-                    for (int i = 0; i < getVipTrockSize(); i++) {
-                        if (viptrockmaps.get(i) != MapId.NONE) {
-                            psReg.setInt(1, getId());
-                            psReg.setInt(2, viptrockmaps.get(i));
-                            psReg.addBatch();
-                        }
-                    }
-                    psReg.executeBatch();
-                }
-
-                // Buddy
-                deleteWhereCharacterId(con, "DELETE FROM buddies WHERE characterid = ? AND pending = 0");
-                try (PreparedStatement psBuddy = con.prepareStatement("INSERT INTO buddies (characterid, `buddyid`, `pending`, `group`) VALUES (?, ?, 0, ?)")) {
-                    psBuddy.setInt(1, id);
-
-                    for (BuddylistEntry entry : buddylist.getBuddies()) {
-                        if (entry.isVisible()) {
-                            psBuddy.setInt(2, entry.getCharacterId());
-                            psBuddy.setString(3, entry.getGroup());
-                            psBuddy.addBatch();
-                        }
-                    }
-                    psBuddy.executeBatch();
-                }
-
-                // Area info
-                deleteWhereCharacterId(con, "DELETE FROM area_info WHERE charid = ?");
-                try (PreparedStatement psArea = con.prepareStatement("INSERT INTO area_info (id, charid, area, info) VALUES (DEFAULT, ?, ?, ?)")) {
-                    psArea.setInt(1, id);
-
-                    for (Entry<Short, String> area : area_info.entrySet()) {
-                        psArea.setInt(2, area.getKey());
-                        psArea.setString(3, area.getValue());
-                        psArea.addBatch();
-                    }
-                    psArea.executeBatch();
-                }
-
-                // Event stats
-                deleteWhereCharacterId(con, "DELETE FROM eventstats WHERE characterid = ?");
-                try (PreparedStatement psEvent = con.prepareStatement("INSERT INTO eventstats (characterid, name, info) VALUES (?, ?, ?)")) {
-                    psEvent.setInt(1, id);
-
-                    for (Map.Entry<String, Events> entry : events.entrySet()) {
-                        psEvent.setString(2, entry.getKey());
-                        psEvent.setInt(3, entry.getValue().getInfo());
-                        psEvent.addBatch();
-                    }
-
-                    psEvent.executeBatch();
-                }
-
-                deleteQuestProgressWhereCharacterId(con, id);
-
-                // Quests and medals
-                try (PreparedStatement psStatus = con.prepareStatement("INSERT INTO queststatus (`queststatusid`, `characterid`, `quest`, `status`, `time`, `expires`, `forfeited`, `completed`) VALUES (DEFAULT, ?, ?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
-                     PreparedStatement psProgress = con.prepareStatement("INSERT INTO questprogress VALUES (DEFAULT, ?, ?, ?, ?)");
-                     PreparedStatement psMedal = con.prepareStatement("INSERT INTO medalmaps VALUES (DEFAULT, ?, ?, ?)")) {
-                    psStatus.setInt(1, id);
-
-                    for (QuestStatus qs : getQuestValues()) {
-                        psStatus.setInt(2, qs.getQuest().getId());
-                        psStatus.setInt(3, qs.getStatus().getId());
-                        psStatus.setInt(4, (int) (qs.getCompletionTime() / 1000));
-                        psStatus.setLong(5, qs.getExpirationTime());
-                        psStatus.setInt(6, qs.getForfeited());
-                        psStatus.setInt(7, qs.getCompleted());
-                        psStatus.executeUpdate();
-
-                        try (ResultSet rs = psStatus.getGeneratedKeys()) {
-                            rs.next();
-                            for (int mob : qs.getProgress().keySet()) {
-                                psProgress.setInt(1, id);
-                                psProgress.setInt(2, rs.getInt(1));
-                                psProgress.setInt(3, mob);
-                                psProgress.setString(4, qs.getProgress(mob));
-                                psProgress.addBatch();
-                            }
-                            psProgress.executeBatch();
-
-                            for (int i = 0; i < qs.getMedalMaps().size(); i++) {
-                                psMedal.setInt(1, id);
-                                psMedal.setInt(2, rs.getInt(1));
-                                psMedal.setInt(3, qs.getMedalMaps().get(i));
-                                psMedal.addBatch();
-                            }
-                            psMedal.executeBatch();
-                        }
-                    }
-                }
-
-                FamilyEntry familyEntry = getFamilyEntry(); //save family rep
-                if (familyEntry != null) {
-                    if (familyEntry.saveReputation(con)) {
-                        familyEntry.savedSuccessfully();
-                    }
-                    FamilyEntry senior = familyEntry.getSenior();
-                    if (senior != null && senior.getChr() == null) { //only save for offline family members
-                        if (senior.saveReputation(con)) {
-                            senior.savedSuccessfully();
-                        }
-                        senior = senior.getSenior(); //save one level up as well
-                        if (senior != null && senior.getChr() == null) {
-                            if (senior.saveReputation(con)) {
-                                senior.savedSuccessfully();
-                            }
-                        }
-                    }
-
-                }
-
-                if (cashShop != null) {
-                    cashShop.save(con);
-                }
-
-                if (storage != null && usedStorage) {
-                    storage.saveToDB(con);
-                    usedStorage = false;
-                }
-
-                con.commit();
-            } catch (Exception e) {
-                con.rollback();
-                throw e;
-            } finally {
-                con.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
-                con.setAutoCommit(true);
+            } catch (SQLException failure) {
+                if (!committed) throw failure;
+                log.warn(I18nUtil.getLogMessage("CharacterSave.connectionCleanup"), snapshot.charId, failure);
             }
-        } catch (Exception e) {
-            log.error("Error saving chr {}, level: {}, job: {}", name, level, job.getId(), e);
+            return SaveResult.SAVED;
         }
+
+        private void release() {
+            if (!committed) return;
+            if (snapshot.storage != null) {
+                savedStorageVersion.accumulateAndGet(snapshot.storage.changeVersion, Math::max);
+            }
+            // 关服线程可能持有 Server 锁并等待当前保存，队列线程不得反向等待 Server。
+            Thread.startVirtualThread(() -> {
+                try {
+                    if (loggedIn && CharacterSaveService.getInstance().isCurrentSession(session)) {
+                        Server.getInstance().updateCharacterEntry(Character.this);
+                    }
+                } catch (RuntimeException failure) {
+                    log.warn(I18nUtil.getLogMessage("CharacterSave.viewFailed"), snapshot.charId, failure);
+                }
+            });
+        }
+
+    }
+
+    private synchronized CharacterSnapshot captureSaveSnapshot() {
+        CharacterSnapshot snap = new CharacterSnapshot();
+        snap.worldId = getWorld();
+        snap.accountId = getAccountId();
+        snap.charId = id;
+        snap.name = name;
+
+        // ---- characters 行（北斗现有角色存档字段）----
+        CharacterSnapshot.CharStats s = snap.stats = new CharacterSnapshot.CharStats();
+        effLock.lock();
+        statWlock.lock();
+        try {
+            s.str = attrStr;
+            s.dex = attrDex;
+            s.luk = attrLuk;
+            s.int_ = attrInt;
+            s.exp = Math.abs(exp.get());
+            s.gachaexp = Math.abs(gachaExp.get());
+            s.hp = hp;
+            s.mp = mp;
+            s.maxhp = maxHp;
+            s.maxmp = maxMp;
+            StringBuilder sps = new StringBuilder();
+            for (int j : remainingSp) {
+                sps.append(j).append(",");
+            }
+            String sp = sps.toString();
+            s.sp = sp.isEmpty() ? "" : sp.substring(0, sp.length() - 1);
+            s.ap = remainingAp;
+        } finally {
+            statWlock.unlock();
+            effLock.unlock();
+        }
+        s.level = level;
+        s.fame = fame;
+        s.gm = gmLevel;
+        s.skincolor = skinColor.getId();
+        s.gender = gender;
+        s.job = job.getId();
+        s.hair = hair;
+        s.face = face;
+        // map 解析（镜像 9493-9501）
+        if (map == null || (cashShop != null && cashShop.isOpened())) {
+            s.map = mapId;
+        } else if (map.getForcedReturnId() != MapId.NONE) {
+            s.map = map.getForcedReturnId();
+        } else {
+            s.map = getHp() < 1 ? map.getReturnMapId() : map.getId();
+        }
+        s.meso = meso.get();
+        s.hpMpUsed = hpMpApUsed;
+        // 解析保存地图对应的出生点。
+        if (map == null || map.getId() == MapId.CRIMSONWOOD_VALLEY_1 || map.getId() == MapId.CRIMSONWOOD_VALLEY_2) {
+            s.spawnpoint = 0;
+        } else {
+            var closest = map.findClosestPlayerSpawnpoint(getPosition());
+            s.spawnpoint = closest != null ? closest.getId() : 0;
+        }
+        prtLock.lock();
+        try {
+            s.party = party != null ? party.getId() : -1;
+        } finally {
+            prtLock.unlock();
+        }
+        s.buddyCapacity = buddylist.getCapacity();
+        if (messenger != null) {
+            s.messengerid = messenger.getId();
+            s.messengerposition = messengerPosition;
+        } else {
+            s.messengerid = 0;
+            s.messengerposition = 4;
+        }
+        if (mapleMount != null) {
+            s.mountlevel = mapleMount.getLevel();
+            s.mountexp = mapleMount.getExp();
+            s.mounttiredness = mapleMount.getTiredness();
+        } else {
+            s.mountlevel = 1;
+            s.mountexp = 0;
+            s.mounttiredness = 0;
+        }
+        s.equipslots = getSlots(1);
+        s.useslots = getSlots(2);
+        s.setupslots = getSlots(3);
+        s.etcslots = getSlots(4);
+        s.monsterbookcover = bookCover;
+        s.vanquisherStage = vanquisherStage;
+        s.dojoPoints = dojoPoints;
+        s.lastDojoStage = dojoStage;
+        s.finishedDojoTutorial = finishedDojoTutorial ? 1 : 0;
+        s.vanquisherKills = vanquisherKills;
+        s.matchcardwins = matchcardwins;
+        s.matchcardlosses = matchcardlosses;
+        s.matchcardties = matchcardties;
+        s.omokwins = omokwins;
+        s.omoklosses = omoklosses;
+        s.omokties = omokties;
+        s.dataString = dataString;
+        s.fquest = questFame;
+        s.jailexpire = jailExpiration;
+        s.partnerId = partnerId;
+        s.marriageItemId = marriageItemId;
+        s.lastExpGainTime = lastExpGainTime;
+        s.ariantPoints = ariantPoints;
+        s.partySearch = canRecvPartySearchInvite;
+
+        // ---- monsterbook（角色卡片进度）----
+        if (monsterBook != null) {
+            snap.monsterbookCards = new LinkedHashMap<>(monsterBook.getCards());
+        }
+
+        // ---- pets ----
+        List<CharacterSnapshot.PetInfo> petList = new ArrayList<>();
+        petLock.lock();
+        try {
+            for (int i = 0; i < 3; i++) {
+                if (pets[i] != null) {
+                    var pet = pets[i];
+                    CharacterSnapshot.PetInfo pi = new CharacterSnapshot.PetInfo();
+                    pi.petid = pet.getUniqueId();
+                    pi.name = pet.getName();
+                    pi.level = pet.getLevel();
+                    pi.closeness = pet.getTameness();
+                    pi.fullness = pet.getFullness();
+                    pi.summoned = pet.isSummoned();
+                    pi.flag = pet.getPetAttribute();
+                    petList.add(pi);
+                }
+            }
+        } finally {
+            petLock.unlock();
+        }
+        snap.pets = petList;
+
+        // ---- keymap ----
+        List<CharacterSnapshot.KeyBindingInfo> kbs = new ArrayList<>();
+        for (var e : keymap.entrySet()) {
+            CharacterSnapshot.KeyBindingInfo kb = new CharacterSnapshot.KeyBindingInfo();
+            kb.key = e.getKey();
+            kb.type = e.getValue().getType();
+            kb.action = e.getValue().getAction();
+            kbs.add(kb);
+        }
+        snap.keymap = kbs;
+
+        // ---- quickslot（账号级；无快捷栏则留 null）----
+        if (quickSlotKeyMapped != null && (quickSlotLoaded == null || !Arrays.equals(quickSlotKeyMapped.GetKeybindings(), quickSlotLoaded))) {
+            snap.quickslot = NumberTool.BytesToLong(quickSlotKeyMapped.GetKeybindings());
+        }
+
+        // ---- skillmacros ----
+        List<CharacterSnapshot.SkillMacroInfo> macros = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            var macro = skillMacros[i];
+            if (macro != null) {
+                CharacterSnapshot.SkillMacroInfo mi = new CharacterSnapshot.SkillMacroInfo();
+                mi.skill1 = macro.getSkill1();
+                mi.skill2 = macro.getSkill2();
+                mi.skill3 = macro.getSkill3();
+                mi.name = macro.getName();
+                mi.shout = macro.getShout();
+                mi.position = i;
+                macros.add(mi);
+            }
+        }
+        snap.skillmacros = macros;
+
+        // ---- 背包物品（inventoryitems + inventoryequipment）----
+        List<CharacterSnapshot.ItemInfo> invItems = new ArrayList<>();
+        for (Inventory iv : inventory) {
+            iv.lockInventory();
+            try {
+                byte type = iv.getType().getType();
+                for (Item item : iv.list()) {
+                    invItems.add(SnapshotCodecs.encodeItem(item, type));
+                }
+            } finally {
+                iv.unlockInventory();
+            }
+        }
+        snap.inventory = invItems;
+        s.meso = meso.get();
+
+        // ---- skills ----
+        List<CharacterSnapshot.SkillInfo> sks = new ArrayList<>();
+        for (var e : skills.entrySet()) {
+            CharacterSnapshot.SkillInfo si = new CharacterSnapshot.SkillInfo();
+            si.skillid = e.getKey().getId();
+            si.skilllevel = e.getValue().skillLevel;
+            si.masterlevel = e.getValue().masterLevel;
+            si.expiration = e.getValue().expiration;
+            sks.add(si);
+        }
+        snap.skills = sks;
+
+        // ---- savedlocations ----
+        List<CharacterSnapshot.SavedLocationInfo> locs = new ArrayList<>();
+        for (SavedLocationType t : SavedLocationType.values()) {
+            var loc = savedLocations[t.ordinal()];
+            if (loc != null) {
+                CharacterSnapshot.SavedLocationInfo li = new CharacterSnapshot.SavedLocationInfo();
+                li.locationtype = t.name();
+                li.map = loc.getMapId();
+                li.portal = loc.getPortal();
+                locs.add(li);
+            }
+        }
+        snap.savedlocations = locs;
+
+        // ---- trocklocations（普通 0 / VIP 1）----
+        List<CharacterSnapshot.TrockInfo> trocks = new ArrayList<>();
+        for (int i = 0; i < getTrockSize(); i++) {
+            if (trockmaps.get(i) != MapId.NONE) {
+                CharacterSnapshot.TrockInfo ti = new CharacterSnapshot.TrockInfo();
+                ti.mapid = trockmaps.get(i);
+                ti.vip = 0;
+                trocks.add(ti);
+            }
+        }
+        for (int i = 0; i < getVipTrockSize(); i++) {
+            if (viptrockmaps.get(i) != MapId.NONE) {
+                CharacterSnapshot.TrockInfo ti = new CharacterSnapshot.TrockInfo();
+                ti.mapid = viptrockmaps.get(i);
+                ti.vip = 1;
+                trocks.add(ti);
+            }
+        }
+        snap.trocklocations = trocks;
+
+        // ---- buddies（pending=0 的可见好友）----
+        List<CharacterSnapshot.BuddyInfo> buds = new ArrayList<>();
+        for (var entry : buddylist.getBuddies()) {
+            if (entry.isVisible()) {
+                CharacterSnapshot.BuddyInfo bi = new CharacterSnapshot.BuddyInfo();
+                bi.buddyid = entry.getCharacterId();
+                bi.group = entry.getGroup();
+                buds.add(bi);
+            }
+        }
+        snap.buddies = buds;
+
+        // ---- area_info ----
+        List<CharacterSnapshot.AreaInfo> areas = new ArrayList<>();
+        for (var e : area_info.entrySet()) {
+            CharacterSnapshot.AreaInfo ai = new CharacterSnapshot.AreaInfo();
+            ai.area = e.getKey();
+            ai.info = e.getValue();
+            areas.add(ai);
+        }
+        snap.areaInfo = areas;
+
+        // ---- eventstats ----
+        List<CharacterSnapshot.EventStatInfo> evs = new ArrayList<>();
+        if (events != null) {
+            for (var e : events.entrySet()) {
+                CharacterSnapshot.EventStatInfo ei = new CharacterSnapshot.EventStatInfo();
+                ei.name = e.getKey();
+                ei.info = e.getValue().getInfo();
+                evs.add(ei);
+            }
+        }
+        snap.eventstats = events == null ? null : evs;
+
+        // ---- quests（queststatus + questprogress + medalmaps）----
+        List<CharacterSnapshot.QuestInfo> qList = new ArrayList<>();
+        for (var status : getQuestValues()) {
+            CharacterSnapshot.QuestInfo qi = new CharacterSnapshot.QuestInfo();
+            qi.quest = status.getQuest().getId();
+            qi.status = status.getStatus().getId();
+            qi.time = status.getCompletionTime() / 1000;
+            qi.expires = status.getExpirationTime();
+            qi.forfeited = status.getForfeited();
+            qi.completed = status.getCompleted();
+            qi.progress = new LinkedHashMap<>(status.getProgress());
+            qi.medalmaps = new ArrayList<>(status.getMedalMaps());
+            qList.add(qi);
+        }
+        snap.quests = qList;
+
+        // ---- family_character（自身声望；cid = charId）----
+        var familyEntry = getFamilyEntry();
+        if (familyEntry != null) {
+            CharacterSnapshot.FamilyRepInfo fi = new CharacterSnapshot.FamilyRepInfo();
+            fi.reputation = familyEntry.getReputation();
+            fi.todaysrep = familyEntry.getTodaysRep();
+            fi.totalreputation = familyEntry.getTotalReputation();
+            fi.reptosenior = familyEntry.getRepsToSenior();
+            snap.family = fi;
+        }
+
+        // ---- cashshop（nx 余额 + 商城背包 + 心愿单）----
+        if (cashShop != null) {
+            snap.cashshop = cashShop.toSnapshot();
+        }
+
+        // ---- storage（仓库槽位/金币 + 仓库物品）----
+        long currentStorageVersion = storageChangeVersion.get();
+        if (storage != null && currentStorageVersion > savedStorageVersion.get()) {
+            snap.storage = storage.toSnapshot();
+            snap.storage.changeVersion = currentStorageVersion;
+        }
+
+        return snap;
     }
 
     public void sendPolice(int greason, String reason, int duration) {
@@ -9582,17 +9785,20 @@ public class Character extends AbstractCharacterObject {
                 setFamilyEntry(null);
             }
 
-            getWorldServer().registerTimedMapObject(() -> {
+            Runnable releaseReferences = () -> {
                 client = null;  // clients still triggers handlers a few times after disconnecting
                 map = null;
                 setListener(null);
 
                 // thanks Shavit for noticing a memory leak with inventories holding owner object
-                for (int i = 0; i < inventory.length; i++) {
-                    inventory[i].dispose();
+                if (inventory != null) {
+                    for (Inventory value : inventory) if (value != null) value.dispose();
+                    inventory = null;
                 }
-                inventory = null;
-            }, MINUTES.toMillis(5));
+            };
+            World worldServer = getWorldServer();
+            if (worldServer == null) releaseReferences.run();
+            else worldServer.registerTimedMapObject(releaseReferences, MINUTES.toMillis(5));
         }
     }
 

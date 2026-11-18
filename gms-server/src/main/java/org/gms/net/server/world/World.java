@@ -256,7 +256,7 @@ public class World {
         mountsSchedule = tman.register(new MountTirednessTask(this), MINUTES.toMillis(1), MINUTES.toMillis(1));
         merchantSchedule = tman.register(new HiredMerchantTask(this), 10 * MINUTES.toMillis(1), 10 * MINUTES.toMillis(1));
         timedMapObjectsSchedule = tman.register(new TimedMapObjectTask(this), MINUTES.toMillis(1), MINUTES.toMillis(1));
-        charactersSchedule = tman.register(new CharacterAutosaverTask(this), HOURS.toMillis(1), HOURS.toMillis(1));
+        charactersSchedule = tman.registerWithFixedDelay(new CharacterAutosaverTask(this), MINUTES.toMillis(60), MINUTES.toMillis(60));
         marriagesSchedule = tman.register(new WeddingReservationTask(this), MINUTES.toMillis(GameConfig.getServerLong("wedding_reservation_interval")), MINUTES.toMillis(GameConfig.getServerLong("wedding_reservation_interval")));
         mapOwnershipSchedule = tman.register(new MapOwnershipTask(this), SECONDS.toMillis(20), SECONDS.toMillis(20));
         fishingSchedule = tman.register(new FishingTask(this), SECONDS.toMillis(10), SECONDS.toMillis(10));
@@ -1608,7 +1608,7 @@ public class World {
         }
     }
 
-    public void registerHiredMerchant(HiredMerchant hm) {
+    public boolean registerHiredMerchant(HiredMerchant hm) {
         activeMerchantsLock.lock();
         try {
             int initProc;
@@ -1618,43 +1618,64 @@ public class World {
                 initProc = 0;
             }
 
+            if (activeMerchants.containsKey(hm.getOwnerId())) {
+                return false;
+            }
             activeMerchants.put(hm.getOwnerId(), new Pair<>(hm, initProc));
+            return true;
         } finally {
             activeMerchantsLock.unlock();
         }
     }
 
-    public void unregisterHiredMerchant(HiredMerchant hm) {
+    public boolean unregisterHiredMerchant(HiredMerchant hm) {
         activeMerchantsLock.lock();
         try {
+            Pair<HiredMerchant, Integer> current = activeMerchants.get(hm.getOwnerId());
+            if (current == null || current.getLeft() != hm) {
+                return false;
+            }
             activeMerchants.remove(hm.getOwnerId());
+            return true;
+        } finally {
+            activeMerchantsLock.unlock();
+        }
+    }
+
+    public boolean isHiredMerchantRegistered(HiredMerchant hm) {
+        activeMerchantsLock.lock();
+        try {
+            Pair<HiredMerchant, Integer> current = activeMerchants.get(hm.getOwnerId());
+            return current != null && current.getLeft() == hm;
         } finally {
             activeMerchantsLock.unlock();
         }
     }
 
     public void runHiredMerchantSchedule() {
-        Map<Integer, Pair<HiredMerchant, Integer>> deployedMerchants;
+        List<HiredMerchant> merchantsToClose = new ArrayList<>();
         activeMerchantsLock.lock();
         try {
             merchantUpdate = Server.getInstance().getCurrentTime();
-            deployedMerchants = new LinkedHashMap<>(activeMerchants);
-
-            for (Map.Entry<Integer, Pair<HiredMerchant, Integer>> dm : deployedMerchants.entrySet()) {
-                int timeOn = dm.getValue().getRight();
-                HiredMerchant hm = dm.getValue().getLeft();
-
-                if (timeOn <= 144) {   // 1440 minutes == 24hrs
-                    activeMerchants.put(hm.getOwnerId(), new Pair<>(dm.getValue().getLeft(), timeOn + 1));
+            for (Map.Entry<Integer, Pair<HiredMerchant, Integer>> entry : activeMerchants.entrySet()) {
+                int timeOn = entry.getValue().getRight();
+                HiredMerchant merchant = entry.getValue().getLeft();
+                if (merchant.isClosedForBan() || timeOn > 144) { // 1440 minutes == 24hrs
+                    merchantsToClose.add(merchant);
                 } else {
-                    hm.forceClose();
-                    this.getChannel(hm.getChannel()).removeHiredMerchant(hm.getOwnerId());
-
-                    activeMerchants.remove(dm.getKey());
+                    entry.setValue(new Pair<>(merchant, timeOn + 1));
                 }
             }
         } finally {
             activeMerchantsLock.unlock();
+        }
+        // 收店需要客户端/物品锁，不能持注册表锁等待，避免与店主操作互锁。
+        for (HiredMerchant merchant : merchantsToClose) {
+            try {
+                merchant.forceClose();
+            } catch (RuntimeException e) {
+                log.error(I18nUtil.getLogMessage("HiredMerchant.close.scheduleFailed", merchant.getOwnerId()), e);
+            }
         }
     }
 

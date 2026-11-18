@@ -30,6 +30,7 @@ import org.gms.net.server.guild.Guild;
 import org.gms.net.server.world.Party;
 import org.gms.net.server.world.PartyCharacter;
 import org.gms.net.server.world.World;
+import org.gms.util.I18nUtil;
 import org.gms.util.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -82,6 +83,7 @@ public class EventManager {
     private final Semaphore startSemaphore = new Semaphore(7);  // 启动信号量
 
     private static final int maxLobbys = 8;     // 一个事件管理器最多支持同时运行的大厅数量
+    private volatile Long nextScheduledTime;
 
     /**
      * 构造函数
@@ -210,11 +212,11 @@ public class EventManager {
             try {
                 iv.invokeFunction(methodName, eim);
             } catch (ScriptException | NoSuchMethodException ex) {
-                log.error("eim（{}），methodName（{}），Event script schedule（事件脚本时间表）", eim,methodName,ex);
+                log.error(I18nUtil.getLogMessage("EventManager.schedule.error1"), eim, methodName, ex);
             }
         };
 
-        ess.registerEntry(r, delay);
+        nextScheduledTime = ess.registerEntry(r, delay);
         return new EventScheduledFuture(r, ess);
     }
 
@@ -229,7 +231,7 @@ public class EventManager {
             try {
                 iv.invokeFunction(methodName, (Object) null);
             } catch (ScriptException | NoSuchMethodException ex) {
-                log.error("Event script scheduleAtTimestamp（事件脚本调度时间戳）", ex);
+                log.error(I18nUtil.getLogMessage("EventManager.scheduleAtTimestamp.error1"), ex);
             }
         };
 
@@ -583,7 +585,7 @@ public class EventManager {
 
                         eim.startEvent();
                     } catch (ScriptException | NoSuchMethodException ex) {
-                        log.error("Event script startInstance（事件脚本startInstance）", ex);
+                        log.error(I18nUtil.getLogMessage("EventManager.startInstance.error1"), ex);
                     }
 
                     return true;
@@ -673,7 +675,7 @@ public class EventManager {
 
                         eim.startEvent();
                     } catch (ScriptException | NoSuchMethodException ex) {
-                        log.error("Event script startInstance（事件脚本startInstance）", ex);
+                        log.error(I18nUtil.getLogMessage("EventManager.startInstance.error1"), ex);
                     }
 
                     return true;
@@ -765,7 +767,7 @@ public class EventManager {
 
                         eim.startEvent();
                     } catch (ScriptException | NoSuchMethodException ex) {
-                        log.error("Event script startInstance（事件脚本startInstance）", ex);
+                        log.error(I18nUtil.getLogMessage("EventManager.startInstance.error1"), ex);
                     }
 
                     return true;
@@ -860,7 +862,7 @@ public class EventManager {
 
                         eim.startEvent();
                     } catch (ScriptException | NoSuchMethodException ex) {
-                        log.error("Event script startInstance（事件脚本启动实例）", ex);
+                        log.error(I18nUtil.getLogMessage("EventManager.startInstance.error2"), ex);
                     }
 
                     return true;
@@ -953,7 +955,7 @@ public class EventManager {
 
                         eim.startEvent();
                     } catch (ScriptException | NoSuchMethodException ex) {
-                        log.error("Event script startInstance（事件脚本启动实例）", ex);
+                        log.error(I18nUtil.getLogMessage("EventManager.startInstance.error2"), ex);
                     }
 
                     return true;
@@ -1002,7 +1004,7 @@ public class EventManager {
         try {
             iv.invokeFunction("clearPQ", eim);
         } catch (ScriptException | NoSuchMethodException ex) {
-            log.error("Event script clearPQ（事件脚本清除PQ）", ex);
+            log.error(I18nUtil.getLogMessage("EventManager.clearPQ.error1"), ex);
         }
     }
 
@@ -1015,7 +1017,7 @@ public class EventManager {
         try {
             iv.invokeFunction("clearPQ", eim, toMap);
         } catch (ScriptException | NoSuchMethodException ex) {
-            log.error("Event script clearPQ（事件脚本清除PQ）", ex);
+            log.error(I18nUtil.getLogMessage("EventManager.clearPQ.error1"), ex);
         }
     }
 
@@ -1077,9 +1079,7 @@ public class EventManager {
      */
     private void exportReadyGuild(Integer guildId) {
         Guild mg = server.getGuild(guildId);
-        String callout = "[公会任务] 您的公会已成功报名参加频道 " + this.getChannelServer().getId() + " 的" +
-                "【家族对抗赛】，当前已进入战略准备阶段。3分钟后将禁止新成员加入任务。" +
-                " 请前往勇士之都挖掘现场寻找NPC双了解更多详情。";
+        String callout = I18nUtil.getMessage("EventManager.exportReadyGuild.message1", this.getChannelServer().getId());
 
         mg.dropMessage(6, callout);
     }
@@ -1091,8 +1091,7 @@ public class EventManager {
      */
     private void exportMovedQueueToGuild(Integer guildId, int place) {
         Guild mg = server.getGuild(guildId);
-        String callout = "[公会任务] 您的公会已成功报名参加频道 " + this.getChannelServer().getId() + " 的" +
-                "【家族对抗赛】，当前在等待队列中排名第 " + GameConstants.ordinal(place) + " 位。";
+        String callout = I18nUtil.getMessage("EventManager.exportMovedQueueToGuild.message1", this.getChannelServer().getId(), GameConstants.ordinal(place));
 
         mg.dropMessage(6, callout);
     }
@@ -1325,5 +1324,9 @@ public class EventManager {
         public void run() {
             instantiateQueuedInstance();
         }
+    }
+
+    public Long getNextScheduledTime() {
+        return nextScheduledTime;
     }
 }

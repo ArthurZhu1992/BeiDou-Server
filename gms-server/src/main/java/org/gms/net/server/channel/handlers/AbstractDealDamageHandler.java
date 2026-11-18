@@ -55,6 +55,7 @@ import org.gms.server.maps.MapItem;
 import org.gms.server.maps.MapObject;
 import org.gms.server.maps.MapObjectType;
 import org.gms.server.maps.MapleMap;
+import org.gms.util.I18nUtil;
 import org.gms.util.PacketCreator;
 import org.gms.util.Randomizer;
 import org.slf4j.Logger;
@@ -70,6 +71,10 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 public abstract class AbstractDealDamageHandler extends AbstractPacketHandler {
 
     private static final Logger log = LoggerFactory.getLogger(ItemPickupHandler.class);
+
+    private static int decodeDamage(int encodedDamage) {
+        return encodedDamage < 0 ? encodedDamage & Integer.MAX_VALUE : encodedDamage;
+    }
 
     public static class AttackInfo {
 
@@ -311,11 +316,12 @@ public abstract class AbstractDealDamageHandler extends AbstractPacketHandler {
 
                     if (attack.magic) { // thanks BHB, Alex (CanIGetaPR) for noticing no immunity status check here
                         if (monster.isBuffed(MonsterStatus.MAGIC_IMMUNITY)) {
-                            Collections.fill(onedList, 1);
+                            // 免疫只压低已命中的伤害，MISS 保持为 0，不能据此触发敛财。
+                            onedList.replaceAll(damage -> decodeDamage(damage) > 0 ? 1 : 0);
                         }
                     } else {
                         if (monster.isBuffed(MonsterStatus.WEAPON_IMMUNITY)) {
-                            Collections.fill(onedList, 1);
+                            onedList.replaceAll(damage -> decodeDamage(damage) > 0 ? 1 : 0);
                         }
                     }
 
@@ -332,10 +338,7 @@ public abstract class AbstractDealDamageHandler extends AbstractPacketHandler {
                     }
 
                     for (Integer eachd : onedList) {
-                        if (eachd < 0) {
-                            eachd += Integer.MAX_VALUE;
-                        }
-                        totDamageToOneMonster += eachd;
+                        totDamageToOneMonster += decodeDamage(eachd);
                     }
                     totDamage += totDamageToOneMonster;
                     monster.aggroMonsterDamage(player, totDamageToOneMonster);
@@ -346,16 +349,13 @@ public abstract class AbstractDealDamageHandler extends AbstractPacketHandler {
                             int delay = 0;
                             final int maxmeso = player.getBuffedValue(BuffStat.PICKPOCKET);
                             for (Integer eachd : onedList) {
-                                eachd += Integer.MAX_VALUE;
+                                // 先解码再排除 MISS：负数是暴击显示位，不能当成零伤害。
+                                final int eachdf = decodeDamage(eachd);
+                                if (eachdf <= 0) {
+                                    continue;
+                                }
 
                                 if (pickpocket.getEffect(picklv).makeChanceResult()) {
-                                    final int eachdf;
-                                    if (eachd < 0) {
-                                        eachdf = eachd + Integer.MAX_VALUE;
-                                    } else {
-                                        eachdf = eachd;
-                                    }
-
                                     TimerManager.getInstance().schedule(() -> map.spawnMesoDrop(Math.min((int) Math.max(((double) eachdf / (double) 20000) * (double) maxmeso, 1), maxmeso), new Point((int) (monster.getPosition().getX() + Randomizer.nextInt(100) - 50), (int) (monster.getPosition().getY())), monster, player, true, (byte) 2), delay);
                                     delay += 100;
                                 }
@@ -370,20 +370,13 @@ public abstract class AbstractDealDamageHandler extends AbstractPacketHandler {
                                 monster.addStolen(0);
 
                                 MonsterInformationProvider mi = MonsterInformationProvider.getInstance();
-                                List<Integer> dropPool = mi.retrieveDropPool(monster.getId());
-                                if (dropPool != null && !dropPool.isEmpty()) {
-                                    int rndPool = (int) Math.floor(Math.random() * dropPool.get(dropPool.size() - 1));
-
-                                    int i = 0;
-                                    while (rndPool >= dropPool.get(i)) {
-                                        i++;
-                                    }
-
+                                MonsterDropEntry stolenDrop = mi.retrieveRandomStealDrop(monster.getId());
+                                if (stolenDrop != null) {
                                     List<MonsterDropEntry> toSteal = new ArrayList<>();
-                                    toSteal.add(mi.retrieveDrop(monster.getId()).get(i));
+                                    toSteal.add(stolenDrop);
 
                                     map.dropItemsFromMonster(toSteal, player, monster);
-                                    monster.addStolen(toSteal.get(0).itemId);
+                                    monster.addStolen(stolenDrop.itemId);
                                 }
                             }
                         }
@@ -536,7 +529,7 @@ public abstract class AbstractDealDamageHandler extends AbstractPacketHandler {
                                             api.gainItem(shellId, (short) -1, false);
                                             totDamageToOneMonster *= player.getLevel();
                                         } else {
-                                            player.dropMessage(5, "你的蜗牛壳已经用完了，无法使用蜗牛投掷术。");  //蜗牛壳消耗完了
+                                            player.dropMessage(5, I18nUtil.getMessage("AbstractDealDamageHandler.applyAttack.message1"));  //蜗牛壳消耗完了
                                             totDamageToOneMonster = 0;
                                         }
                                     } else {

@@ -55,6 +55,7 @@ import org.gms.net.server.guild.GuildPackets;
 import org.gms.net.server.world.PartyCharacter;
 import org.gms.net.server.world.PartyOperation;
 import org.gms.net.server.world.World;
+import org.gms.server.quest.medal.OutstandingCitizenMedal;
 import org.gms.service.HpMpAlertService;
 import org.gms.util.I18nUtil;
 import org.gms.util.packets.WeddingPackets;
@@ -112,11 +113,13 @@ public final class PlayerLoggedinHandler extends AbstractPacketHandler {
     public final void handlePacket(InPacket p, Client c) {  //角色进入频道函数入口
         final int cid = p.readInt(); // TODO: investigate if this is the "client id" supplied in PacketCreator#getServerIP()
         final Server server = Server.getInstance();
+        if (server.isShuttingDown()) { c.disconnect(true, false); return; }
 
 
         if (!c.tryacquireClient()) {
             // thanks MedicOP for assisting on concurrency protection here
             c.sendPacket(PacketCreator.getAfterLoginError(10));
+            return;
         }
 
         try {
@@ -174,6 +177,8 @@ public final class PlayerLoggedinHandler extends AbstractPacketHandler {
             c.setPlayer(player);
             c.setAccID(player.getAccountId());
 
+            Client sourceClient = newcomer ? null : player.getClient();
+            boolean inMemoryMigration = sourceClient != null && sourceClient.isInMemoryTransition();
             boolean allowLogin = true;
 
                 /*  is this check really necessary?
@@ -195,7 +200,7 @@ public final class PlayerLoggedinHandler extends AbstractPacketHandler {
             int accId = c.getAccID();
             if (tryAcquireAccount(accId)) { // Sync this to prevent wrong login state for double loggedin handling
                 try {
-                    int state = c.getLoginState();
+                    int state = inMemoryMigration ? Client.LOGIN_SERVER_TRANSITION : c.getLoginState();
                     if (state != Client.LOGIN_SERVER_TRANSITION || !allowLogin) {
                         c.setPlayer(null);
                         c.setAccID(0);
@@ -204,11 +209,22 @@ public final class PlayerLoggedinHandler extends AbstractPacketHandler {
                             c.disconnect(true, false);
                         } else {
                             c.sendPacket(PacketCreator.getAfterLoginError(7));
+                            c.disconnect(false, false);
                         }
 
                         return;
                     }
-                    c.updateLoginState(Client.LOGIN_LOGGEDIN);
+                    if (inMemoryMigration) {
+                        synchronized (player) {
+                            if (player.getClient() != sourceClient || !sourceClient.isInMemoryTransition()) {
+                                throw new IllegalStateException(I18nUtil.getExceptionMessage("CHARACTER_SAVE_UNAVAILABLE"));
+                            }
+                            player.newClient(c);
+                        }
+                    } else if (!c.updateLoginState(Client.LOGIN_LOGGEDIN)) {
+                        c.disconnect(true, false);
+                        return;
+                    }
                 } finally {
                     releaseAccount(accId);
                 }
@@ -216,13 +232,15 @@ public final class PlayerLoggedinHandler extends AbstractPacketHandler {
                 c.setPlayer(null);
                 c.setAccID(0);
                 c.sendPacket(PacketCreator.getAfterLoginError(10));
+                c.disconnect(false, false);
                 return;
             }
 
             if (!newcomer) {
-                c.setLanguage(player.getClient().getLanguage());
-                c.setCharacterSlots((byte) player.getClient().getCharacterSlots());
-                player.newClient(c);
+                c.setLanguage(sourceClient.getLanguage());
+                c.setCharacterSlots((byte) sourceClient.getCharacterSlots());
+                if (!inMemoryMigration) player.newClient(c);
+                SessionCoordinator.getInstance().updateOnlineClient(c);
             }
 
             // 增加参数判断，避免给客户端发未知包导致异常
@@ -322,7 +340,7 @@ public final class PlayerLoggedinHandler extends AbstractPacketHandler {
                             newAlliance = Alliance.loadAlliance(allianceId);
                             if (newAlliance != null) {
                                 server.addAlliance(allianceId, newAlliance);
-                            } else {
+                            } else if (Alliance.isAllianceMissing(allianceId)) {
                                 player.getGuild().setAllianceId(0);
                             }
                         }
@@ -338,7 +356,7 @@ public final class PlayerLoggedinHandler extends AbstractPacketHandler {
                 }
             }
             //展示服务信息
-            org.gms.server.quest.medal.OutstandingCitizenMedal.refreshEligibility(player);
+            OutstandingCitizenMedal.refreshEligibility(player);
             noteService.show(player);
             //异常地图掉线信息提示
             c.getSysRescue().showMapChangeMessage(player);
@@ -399,7 +417,7 @@ public final class PlayerLoggedinHandler extends AbstractPacketHandler {
                     }
                     */
                 if (player.isGM()) {
-                    Server.getInstance().broadcastGMMessage(c.getWorld(), PacketCreator.earnTitleMessage((player.gmLevel() < 6 ? "GM " : "Admin ") + player.getName() + " 登录了游戏"));
+                    Server.getInstance().broadcastGMMessage(c.getWorld(), PacketCreator.earnTitleMessage(I18nUtil.getMessage("PlayerLoggedinHandler.handlePacket.message1", player.gmLevel() < 6 ? "GM" : "Admin", player.getName())));
                 } else {
                     if (GameConfig.getServerBoolean("use_login_notification")) {
                         String msg = I18nUtil.getMessage("Character.login.globalNotice", player.getName());
@@ -474,8 +492,14 @@ public final class PlayerLoggedinHandler extends AbstractPacketHandler {
             if (newcomer) {
                 player.setLoginTime(System.currentTimeMillis());
             }
-        } catch (Exception e) {
-            e.printStackTrace();
+        } catch (Exception failure) {
+            log.error(I18nUtil.getLogMessage("CharacterSave.channelLoginFailed"), cid, c.getSessionId(), failure);
+            World world = server.getWorld(c.getWorld());
+            Character waiting = world == null ? null : world.getPlayerStorage().getCharacterById(cid);
+            if (waiting != null && waiting.getClient() != c && waiting.getClient().isInMemoryTransition()) {
+                waiting.getClient().expireUnclaimedTransition(cid);
+            }
+            c.disconnect(true, false);
         } finally {
             c.releaseClient();
         }

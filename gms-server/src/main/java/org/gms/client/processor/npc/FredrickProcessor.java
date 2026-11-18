@@ -38,6 +38,7 @@ import org.gms.server.ItemInformationProvider;
 import org.gms.server.maps.HiredMerchant;
 import org.gms.service.NoteService;
 import org.gms.util.DatabaseConnection;
+import org.gms.util.I18nUtil;
 import org.gms.util.PacketCreator;
 import org.gms.util.Pair;
 
@@ -100,9 +101,9 @@ public class FredrickProcessor {
         String msg;
 
         if (daynotes < 4) {
-            msg = "您好，亲爱的顾客! 我是弗兰德里, 雇佣商人工会的主席. 您的店铺已经关闭" + dailyReminders[daynotes] + " 天了. 请到自由市场入口找我取回存储的物品.";
+            msg = I18nUtil.getMessage("FredrickProcessor.fredrickReminderMessage.message1", dailyReminders[daynotes]);
         } else {
-            msg = "您好，亲爱的顾客! 我是弗兰德里, 雇佣商人工会的主席. 您的店铺已经关闭 " + dailyReminders[daynotes] + " 天了. 在我们撤走之前，请考虑索回这些物品";
+            msg = I18nUtil.getMessage("FredrickProcessor.fredrickReminderMessage.message2", dailyReminders[daynotes]);
         }
 
         return msg;
@@ -277,6 +278,18 @@ public class FredrickProcessor {
             try {
                 Character chr = c.getPlayer();
 
+                // Dupe guard: while a hired merchant is open (or being set up), the listed items live both in the
+                // in-memory items list and in the DB (type=6). Allowing a retrieve here would delete the DB copy
+                // and return it to the inventory while the in-memory copy stays on the shelf, so the same item can
+                // be claimed twice (via takeItemBack / closeShop saveItems). The disconnect-recovery path
+                // (HiredMerchantRequest) closes the store first and sets hasMerchant=false, so it is unaffected.
+                HiredMerchant active = c.getWorldServer().getHiredMerchant(chr.getId());
+                if (chr.hasMerchant() || (active != null && active.isOwner(chr))) {
+                    chr.dropMessage(1, "Please close your hired merchant before retrieving stored items.");
+                    chr.sendPacket(PacketCreator.enableActions());
+                    return;
+                }
+
                 List<Pair<Item, InventoryType>> items;
                 try {
                     items = ItemFactory.MERCHANT.loadItems(chr.getId(), false);
@@ -292,7 +305,8 @@ public class FredrickProcessor {
                     if (deleteFredrickItems(chr.getId())) {
                         HiredMerchant merchant = chr.getHiredMerchant();
 
-                        if (merchant != null) {
+                        // 当前关联也可能是正在访问的其他玩家商店，只清理领取者自己的货架。
+                        if (merchant != null && merchant.isOwner(chr)) {
                             merchant.clearItems();
                         }
 

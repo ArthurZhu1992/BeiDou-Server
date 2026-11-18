@@ -1,8 +1,16 @@
 package org.gms.service;
 
+import org.gms.net.server.services.task.world.CharacterSaveService;
+import org.gms.net.server.coordinator.session.SessionCoordinator;
+import org.gms.net.server.coordinator.session.SessionCoordinator.AccountSession;
+import org.gms.client.Client;
+import org.gms.exception.BizException;
+import org.gms.exception.BizExceptionEnum;
+
 import com.mybatisflex.core.paginate.Page;
 import com.mybatisflex.core.query.QueryWrapper;
 import lombok.AllArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.gms.client.Character;
 import org.gms.client.Client;
 import org.gms.client.DefaultDates;
@@ -13,6 +21,8 @@ import org.gms.model.dto.AddAccountDTO;
 import org.gms.model.dto.UpdateAccountByGmDTO;
 import org.gms.model.dto.UpdateAccountByUserDTO;
 import org.gms.net.server.Server;
+import org.gms.net.server.world.World;
+import org.gms.server.maps.HiredMerchant;
 import org.gms.util.BCrypt;
 import org.gms.util.HexTool;
 import org.gms.util.I18nUtil;
@@ -35,6 +45,7 @@ import static org.gms.dao.entity.table.IpbansDOTableDef.IPBANS_D_O;
 
 @Service
 @AllArgsConstructor
+@Slf4j
 public class AccountService {
     private final AccountsMapper accountsMapper;
     private final CharactersMapper charactersMapper;
@@ -77,7 +88,32 @@ public class AccountService {
     }
 
     public void update(AccountsDO condition) {
-        accountsMapper.update(condition);
+        if (accountsMapper.update(condition) > 0
+                && (Boolean.TRUE.equals(condition.getBanned())
+                || condition.getTempban() != null && condition.getTempban().getTime() > System.currentTimeMillis())) {
+            closeAccountHiredMerchants(condition.getId());
+        }
+    }
+
+    /** 雇佣商店不依赖角色在线，按账号全角色、全世界收店。 */
+    public void closeAccountHiredMerchants(int accountId) {
+        List<CharactersDO> owners;
+        try {
+            owners = charactersMapper.selectIdAndWorldListByAccountId(accountId);
+        } catch (RuntimeException e) {
+            log.error(I18nUtil.getLogMessage("AccountService.closeMerchants.lookupFailed", accountId), e);
+            return;
+        }
+        for (World world : Server.getInstance().getWorlds()) {
+            for (CharactersDO owner : owners) {
+                try {
+                    HiredMerchant merchant = world.getHiredMerchant(owner.getId());
+                    if (merchant != null) merchant.closeForBan();
+                } catch (RuntimeException e) {
+                    log.error(I18nUtil.getLogMessage("AccountService.closeMerchants.closeFailed", accountId, owner.getId()), e);
+                }
+            }
+        }
     }
 
     public void addAccount(AddAccountDTO submitData) throws NoSuchAlgorithmException {
@@ -145,11 +181,6 @@ public class AccountService {
         accountsMapper.update(account);
     }
 
-    public void deleteAccountByGM(int id) {
-        RequireUtil.requireNotNull(findById(id), I18nUtil.getExceptionMessage("AccountService.id.NotExist"));
-        accountsMapper.deleteById(id);
-    }
-
     public String encryptPassword(String password) throws NoSuchAlgorithmException {
         return GameConfig.getServerBoolean("bcrypt_migration") ? BCrypt.hashpw(password, BCrypt.gensalt(12)) : BCrypt.hashpwSHA512(password);
     }
@@ -175,11 +206,17 @@ public class AccountService {
 
     public void resetAllLoggedIn(int id) {
         RequireUtil.requireNotNull(findById(id), I18nUtil.getExceptionMessage("AccountService.id.NotExist"));
-
-        AccountsDO account = new AccountsDO();
-        account.setId(id);
-        account.setLoggedin(LOGIN_NOTLOGGEDIN);
-        accountsMapper.update(account);
+        AccountSession account = SessionCoordinator.getInstance().getAccountSession(id);
+        synchronized (account) {
+            Client registered = SessionCoordinator.getInstance().getClientByAccID(id);
+            if ((registered != null && registered.hasActiveConnection())
+                    || CharacterSaveService.getInstance().hasUnfinishedSession(id) || Client.hasPendingDisconnectForAccount(id)) {
+                throw new BizException(BizExceptionEnum.CHARACTER_SAVE_UNAVAILABLE);
+            }
+            AccountsDO value = new AccountsDO(); value.setId(id); value.setLoggedin(LOGIN_NOTLOGGEDIN);
+            accountsMapper.update(value);
+            account.retire();
+        }
     }
 
     public void banAccount(int accountId, String reason) {
@@ -190,15 +227,13 @@ public class AccountService {
         account.setId(accountId);
         account.setBanned(true);
         account.setBanreason(reason);
-        accountsMapper.update(account);
+        update(account);
         // 遍历账号下的角色，如果在线，追封客户端/Mac/IP
         List<CharactersDO> characterList = charactersMapper.selectIdAndWorldListByAccountId(accountId); // 仅查询角色ID和所在world
         for (CharactersDO chr : characterList) {
-            Character player = Server.getInstance()
-                    .getWorlds()
-                    .get(chr.getWorld())
-                    .getPlayerStorage()
-                    .getCharacterById(chr.getId());
+            World world = Server.getInstance().getWorld(chr.getWorld());
+            if (world == null) continue;
+            Character player = world.getPlayerStorage().getCharacterById(chr.getId());
             if (player == null) continue; // 角色离线
             player.setBanned(true);
             Client c = player.getClient(); // 角色在线，获取客户端
@@ -228,11 +263,12 @@ public class AccountService {
     }
 
     public void resetAllLoggedIn() {
+        if (CharacterSaveService.getInstance().hasUnfinishedSessions()) throw new BizException(BizExceptionEnum.CHARACTER_SAVE_UNAVAILABLE);
         accountsMapper.updateAllLoggedIn(0);
     }
 
     public void ban(Character chr, String reason) {
-        accountsMapper.update(AccountsDO.builder().banned(true).id(chr.getAccountId()).banreason(reason).build());
+        update(AccountsDO.builder().banned(true).id(chr.getAccountId()).banreason(reason).build());
         // 更新在线的ban状态
         chr.setBanned(true);
     }
@@ -260,7 +296,7 @@ public class AccountService {
         if (accountId == null) {
             throw new NoSuchElementException();
         }
-        accountsMapper.update(AccountsDO.builder()
+        update(AccountsDO.builder()
                 .id(accountId)
                 .banreason(reason)
                 .banned(true)

@@ -45,6 +45,7 @@ import org.gms.net.server.services.task.channel.OverallService;
 import org.gms.net.server.services.type.ChannelServices;
 import org.gms.net.server.world.Party;
 import org.gms.net.server.world.World;
+import org.gms.util.I18nUtil;
 import org.gms.util.NumberTool;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -693,7 +694,7 @@ public class MapleMap {
                     if (ItemConstants.getInventoryType(de.itemId) == InventoryType.EQUIP) {
                         idrop = ii.randomizeStats((Equip) ii.getEquipById(de.itemId));
                     } else {
-                        idrop = new Item(de.itemId, (short) 0, (short) (de.Maximum != 1 ? Randomizer.nextInt(de.Maximum - de.Minimum) + de.Minimum : 1));
+                        idrop = new Item(de.itemId, (short) 0, (short) ((de.Maximum != 1 && de.Maximum > de.Minimum)? Randomizer.nextInt(de.Maximum - de.Minimum) + de.Minimum : de.Maximum));
                     }
                     spawnDrop(idrop, calcDropPos(pos, mob.getPosition()), mob, chr, droptype, de.questid);
                 }
@@ -756,7 +757,7 @@ public class MapleMap {
         }
 
         final MonsterInformationProvider mi = MonsterInformationProvider.getInstance();
-        final List<MonsterGlobalDropEntry> globalEntry = mi.getRelevantGlobalDrops(this.getId());
+        final List<MonsterGlobalDropEntry> globalEntry = new ArrayList<>(mi.getRelevantGlobalDrops(this.getId()));
 
         final List<MonsterDropEntry> dropEntry = new ArrayList<>();
         final List<MonsterDropEntry> visibleQuestEntry = new ArrayList<>();
@@ -765,7 +766,7 @@ public class MapleMap {
         List<MonsterDropEntry> lootEntry = GameConfig.getServerBoolean("use_spawn_relevant_loot") ? mob.retrieveRelevantDrops() : mi.retrieveEffectiveDrop(mob.getId());
         sortDropEntries(lootEntry, dropEntry, visibleQuestEntry, otherQuestEntry, chr);     // thanks Articuno, Limit, Rohenn for noticing quest loots not showing up in only-quest item drops scenario
 
-        if (lootEntry.isEmpty()) {   // thanks resinate
+        if (lootEntry.isEmpty() && globalEntry.isEmpty()) {   // thanks resinate
             return;
         }
 
@@ -1058,43 +1059,55 @@ public class MapleMap {
     public List<MapItem> updatePlayerItemDropsToParty(int partyid, int charid, List<Character> partyMembers, Character partyLeaver) {
         List<MapItem> partyDrops = new LinkedList<>();
 
-        for (MapItem mdrop : getDroppedItems()) {
-            if (mdrop.getOwnerId() == charid) {
-                mdrop.lockItem();
-                try {
-                    if (mdrop.isPickedUp()) {
-                        continue;
-                    }
+        // owner 字段(character_ownerid / party_ownerid)是实例字段,持 itemLock 的
+        // 路径会写它们,所以这里必须持同一把锁读,避免锁外读出撕裂值。
+        // 同时把对队员/leaver 的 sendPacket 收集到 packetHolder 中,
+        // 离开锁再发,避免 itemLock 持锁期间做网络 I/O。
+        Map<Character, List<Packet>> packetHolder = new HashMap<>();
 
-                    mdrop.setPartyOwnerId(partyid);
+        for (MapItem mdrop : getDroppedItems()) {
+            mdrop.lockItem();
+            try {
+                if (mdrop.isPickedUp()) {
+                    continue;
+                }
+
+                if (mdrop.getOwnerIdLocked() == charid) {
+                    mdrop.setPartyOwnerIdLocked(partyid);
 
                     Packet removePacket = PacketCreator.silentRemoveItemFromMap(mdrop.getObjectId());
                     Packet updatePacket = PacketCreator.updateMapItemObject(mdrop, partyLeaver == null);
 
                     for (Character mc : partyMembers) {
                         if (this.equals(mc.getMap())) {
-                            mc.sendPacket(removePacket);
+                            packetHolder.computeIfAbsent(mc, k -> new ArrayList<>()).add(removePacket);
 
                             if (mc.needQuestItem(mdrop.getQuest(), mdrop.getItemId())) {
-                                mc.sendPacket(updatePacket);
+                                packetHolder.get(mc).add(updatePacket);
                             }
                         }
                     }
 
                     if (partyLeaver != null) {
                         if (this.equals(partyLeaver.getMap())) {
-                            partyLeaver.sendPacket(removePacket);
+                            packetHolder.computeIfAbsent(partyLeaver, k -> new ArrayList<>()).add(removePacket);
 
                             if (partyLeaver.needQuestItem(mdrop.getQuest(), mdrop.getItemId())) {
-                                partyLeaver.sendPacket(PacketCreator.updateMapItemObject(mdrop, true));
+                                packetHolder.get(partyLeaver).add(PacketCreator.updateMapItemObject(mdrop, true));
                             }
                         }
                     }
-                } finally {
-                    mdrop.unlockItem();
+                } else if (partyid != -1 && mdrop.getPartyOwnerIdLocked() == partyid) {
+                    partyDrops.add(mdrop);
                 }
-            } else if (partyid != -1 && mdrop.getPartyOwnerId() == partyid) {
-                partyDrops.add(mdrop);
+            } finally {
+                mdrop.unlockItem();
+            }
+        }
+
+        for (Map.Entry<Character, List<Packet>> e : packetHolder.entrySet()) {
+            for (Packet p : e.getValue()) {
+                e.getKey().sendPacket(p);
             }
         }
 
@@ -1102,27 +1115,28 @@ public class MapleMap {
     }
 
     public void updatePartyItemDropsToNewcomer(Character newcomer, List<MapItem> partyItems) {
+        // 同样:itemLock 内只构造 packet,持锁期间不做 sendPacket。
         for (MapItem mdrop : partyItems) {
+            Packet removePacket;
+            Packet updatePacket;
+
             mdrop.lockItem();
             try {
                 if (mdrop.isPickedUp()) {
                     continue;
                 }
 
-                Packet removePacket = PacketCreator.silentRemoveItemFromMap(mdrop.getObjectId());
-                Packet updatePacket = PacketCreator.updateMapItemObject(mdrop, true);
-
-                if (newcomer != null) {
-                    if (this.equals(newcomer.getMap())) {
-                        newcomer.sendPacket(removePacket);
-
-                        if (newcomer.needQuestItem(mdrop.getQuest(), mdrop.getItemId())) {
-                            newcomer.sendPacket(updatePacket);
-                        }
-                    }
-                }
+                removePacket = PacketCreator.silentRemoveItemFromMap(mdrop.getObjectId());
+                updatePacket = PacketCreator.updateMapItemObject(mdrop, true);
             } finally {
                 mdrop.unlockItem();
+            }
+
+            if (newcomer != null && this.equals(newcomer.getMap())) {
+                newcomer.sendPacket(removePacket);
+                if (newcomer.needQuestItem(mdrop.getQuest(), mdrop.getItemId())) {
+                    newcomer.sendPacket(updatePacket);
+                }
             }
         }
     }
@@ -1361,23 +1375,22 @@ public class MapleMap {
 
     // 巴洛古(Balrog)讨伐胜利广播
     public void broadcastBalrogVictory(String leaderName) {
-        getWorldServer().dropMessage(6,"[远征凯旋] " + leaderName + "的远征队成功讨伐了火焰魔神巴洛古！" + "让我们歌颂这支队伍，他们以" + countAlivePlayers() + "名幸存者的战绩完成了壮举！");
+        getWorldServer().dropMessage(6, I18nUtil.getMessage("MapleMap.broadcastBalrogVictory.message1", leaderName, countAlivePlayers()));
     }
 
     // 暗黑龙王(Horntail)讨伐胜利广播
     public void broadcastHorntailVictory() {
-        getWorldServer().dropMessage(6,"[远征凯旋] 致历经无数次挑战最终征服暗黑龙王的勇士们：" + "谨以此礼赞献给真正的神木村英雄！");
+        getWorldServer().dropMessage(6, I18nUtil.getMessage("MapleMap.broadcastHorntailVictory.message1"));
     }
 
     // 扎昆(Zakum)讨伐胜利广播
     public void broadcastZakumVictory() {
-        getWorldServer().dropMessage(6,"[远征凯旋] 长久笼罩天空之城的邪恶之树终于倾倒！" +"致那些历经无数次尝试最终征服扎昆的远征队，胜利属于你们！" +"你们是天空之城真正的传说！");
+        getWorldServer().dropMessage(6, I18nUtil.getMessage("MapleMap.broadcastZakumVictory.message1"));
     }
 
     // 品克缤(PinkBean)讨伐胜利广播
     public void broadcastPinkBeanVictory(int channel) {
-        getWorldServer().dropMessage(6,"[远征凯旋] 在" + channel + "频道挑战品克缤的远征队，" +  "以雷霆之势完成了终极讨伐！时间神殿重现璀璨光辉，" + "当英雄们从战场凯旋之时，被夺走的白昼终于归来！"
-        );
+        getWorldServer().dropMessage(6, I18nUtil.getMessage("MapleMap.broadcastPinkBeanVictory.message1", channel));
     }
 
 
@@ -1505,9 +1518,12 @@ public class MapleMap {
     }
 
     public void killMonster(int mobId) {
-        Character chr = (Character) getPlayers().get(0);
+        Character chr = null;
+        List<MapObject> players = getPlayers();
+        if (!players.isEmpty()) {
+            chr = (Character) players.get(0);
+        }
         List<Monster> mobList = getAllMonsters();
-
         for (Monster mob : mobList) {
             if (mob.getId() == mobId) {
                 this.killMonster(mob, chr, false);
@@ -2018,7 +2034,7 @@ public class MapleMap {
             } else if (monster.getId() == MobId.GIANT_SNOWMAN_LV5_EASY || monster.getId() == MobId.GIANT_SNOWMAN_LV5_MEDIUM || monster.getId() == MobId.GIANT_SNOWMAN_LV5_HARD) {
                 monsterItemDrop(monster, monster.getDropPeriodTime());
             } else {
-                log.error("[异常刷怪] 检测到未配置定时刷新的怪物: ID={}", monster.getId());
+                log.error(I18nUtil.getLogMessage("MapleMap.spawnMonster.error1"), monster.getId());
             }
         }
 
@@ -2092,7 +2108,7 @@ public class MapleMap {
     public Portal getDoorPortal(int doorid) {
         Portal doorPortal = portals.get(0x80 + doorid);
         if (doorPortal == null) {
-            log.warn("[传动点] 地图 {} (ID:{}) 不存在传送门ID为 {} 的入口", mapName, mapid, doorid);
+            log.warn(I18nUtil.getLogMessage("MapleMap.getDoorPortal.warn1"), mapName, mapid, doorid);
             return portals.get(0x80);
         }
 
@@ -2388,6 +2404,8 @@ public class MapleMap {
     }
 
     public void addPlayer(final Character chr) {
+        cleanupGhostPlayers();   // 被动清理：进图前先清掉图上"已断线未正常移除"的幽灵玩家，避免其他人仍看到他
+
         int chrSize;
         Party party = chr.getParty();
         chrWLock.lock();
@@ -2703,7 +2721,15 @@ public class MapleMap {
     }
 
     public void removePlayer(Character chr) {
-        Channel cserv = chr.getClient().getChannelServer();
+        // 优先重分配该玩家控制的怪物 controller，防止后续步骤抛异常导致 leaveMap()->releaseControlledMonsters() 没执行，
+        // 怪物 controller 卡在已离线玩家身上（幽灵致怪物不动的根因之一）。
+        try {
+            chr.releaseControlledMonsters();
+        } catch (Throwable t) {
+            log.warn(I18nUtil.getLogMessage("MapleMap.removePlayer.warn1"), chr.getName(), t);
+        }
+
+        Channel cserv = chr.getClient() != null ? chr.getClient().getChannelServer() : null;
         chr.unregisterChairBuff();
 
         Party party = chr.getParty();
@@ -2718,7 +2744,7 @@ public class MapleMap {
             chrWLock.unlock();
         }
 
-        if (MiniDungeonInfo.isDungeonMap(mapid)) {
+        if (cserv != null && MiniDungeonInfo.isDungeonMap(mapid)) {
             MiniDungeon mmd = cserv.getMiniDungeon(mapid);
             if (mmd != null) {
                 if (!mmd.unregisterPlayer(chr)) {
@@ -2750,6 +2776,36 @@ public class MapleMap {
                 this.broadcastGMPacket(chr, PacketCreator.removeDragon(chr.getId()));
             } else {
                 this.broadcastPacket(chr, PacketCreator.removeDragon(chr.getId()));
+            }
+        }
+    }
+
+    /**
+     * 被动清理本图上"已断线（isAwayFromWorld）却未被正常移除"的幽灵玩家。
+     * 在 addPlayer 时触发：新玩家进图前先清掉幽灵并广播 removePlayerFromMap，
+     * 使新玩家与图上原有玩家都不再看到这个已下线的角色。配合 Client.removePlayer 的 A 修复兜底漏网情况。
+     * awayFromWorld=true 涵盖已断开/商城/mts，这类玩家本就不该留在地图 characters，留在即幽灵，正常在线玩家 awayFromWorld=false 不受影响。
+     */
+    private void cleanupGhostPlayers() {
+        List<Character> ghosts = new ArrayList<>();
+        chrRLock.lock();
+        try {
+            for (Character c : characters) {
+                if (c != null && c.isAwayFromWorld()) {
+                    ghosts.add(c);
+                }
+            }
+        } finally {
+            chrRLock.unlock();
+        }
+
+        for (Character ghost : ghosts) {
+            log.warn(I18nUtil.getLogMessage("MapleMap.cleanupGhostPlayers.warn1"), mapid, ghost.getName());
+            try {
+                removePlayer(ghost);
+            } catch (Throwable t) {
+                // 单个幽灵清理失败不应影响其他幽灵清理，也不应阻断 addPlayer 流程
+                log.error(I18nUtil.getLogMessage("MapleMap.cleanupGhostPlayers.error1"), mapid, ghost.getName(), t);
             }
         }
     }
@@ -2882,7 +2938,7 @@ public class MapleMap {
                 String mobName = MonsterInformationProvider.getInstance().getMobNameFromId(monster.getId());
                 if (mobName != null) {
                     mobName = mobName.trim();
-                    this.dropMessage(5, "这片草坪已被" + mobName + "的部队占领，击败他们才能夺回控制权！");
+                    this.dropMessage(5, I18nUtil.getMessage("MapleMap.updateBossSpawn.message1", mobName));
                 }
             }
         }
@@ -3234,14 +3290,14 @@ public class MapleMap {
     public void reportMonsterSpawnPoints(Character chr) {
         // 输出地图刷怪点统计信息头
         chr.dropMessage(6, "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        chr.dropMessage(6, "┃ 地图ID: " + getId() + " | 总刷怪点: " + monsterSpawn.size() +  " | 已刷怪: " + spawnedMonstersOnMap.get());
+        chr.dropMessage(6, I18nUtil.getMessage("MapleMap.reportMonsterSpawnPoints.message1", getId(), monsterSpawn.size(), spawnedMonstersOnMap.get()));
         chr.dropMessage(6, "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
         // 遍历所有刷怪点输出详细信息
         for (SpawnPoint sp : getAllMonsterSpawn()) {
             chr.dropMessage(6,
-                    "┃ ID:" + sp.getMonsterId() + " | 可刷怪:" + (sp.getDenySpawn() ? "×" : "√") + " | 现存:" + sp.getSpawned() + "\n" +
-                    "┃ 坐标:(" +(int) sp.getPosition().getX() + " , " + (int) sp.getPosition().getY() + ") | 刷新:" + sp.getMobTime() + "ms | 阵营:" + sp.getTeam()
+                    I18nUtil.getMessage("MapleMap.reportMonsterSpawnPoints.message2", sp.getMonsterId(), (sp.getDenySpawn() ? "×" : "√"), sp.getSpawned(),
+                            (int) sp.getPosition().getX(), (int) sp.getPosition().getY(), sp.getMobTime(), sp.getTeam())
             );
         }
         chr.dropMessage(6, "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -4054,21 +4110,19 @@ public class MapleMap {
     }
 
     public String getEventNPC() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("请与 "+ mapName + " 的 ");
+        String npcName;
         if (mapid == MapId.SOUTHPERRY) {
-            sb.append("珀尔");
+            npcName = I18nUtil.getMessage("MapleMap.getEventNPC.npc1");
         } else if (mapid == MapId.LITH_HARBOUR) {
-            sb.append("江");
+            npcName = I18nUtil.getMessage("MapleMap.getEventNPC.npc2");
         } else if (mapid == MapId.ORBIS) {
-            sb.append("马丁");
+            npcName = I18nUtil.getMessage("MapleMap.getEventNPC.npc3");
         } else if (mapid == MapId.LUDIBRIUM) {
-            sb.append("托尼");
+            npcName = I18nUtil.getMessage("MapleMap.getEventNPC.npc4");
         } else {
             return null;
         }
-        sb.append(" 进行对话。");
-        return sb.toString();
+        return I18nUtil.getMessage("MapleMap.getEventNPC.message1", mapName, npcName);
     }
 
     public boolean hasEventNPC() {
@@ -4275,7 +4329,7 @@ public class MapleMap {
         long timeNow = Server.getInstance().getCurrentTime();
         if (timeNow - mapOwnerLastActivityTime > 60000) {
             if (unclaimOwnership() != null) {
-                this.dropMessage(5, "这里现在是无主之地了。");
+                this.dropMessage(5, I18nUtil.getMessage("MapleMap.checkMapOwnerActivity.message1"));
             }
         }
     }

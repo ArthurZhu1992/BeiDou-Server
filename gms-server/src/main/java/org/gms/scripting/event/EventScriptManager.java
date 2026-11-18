@@ -25,10 +25,12 @@ import org.gms.net.server.channel.Channel;
 import org.slf4j.LoggerFactory;
 import org.gms.scripting.AbstractScriptManager;
 import org.gms.scripting.SynchronizedInvocable;
+import org.gms.util.I18nUtil;
 
 import javax.script.Invocable;
 import javax.script.ScriptEngine;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
@@ -103,7 +105,7 @@ public class EventScriptManager extends AbstractScriptManager {
             try {
                 entry.iv.invokeFunction("init", (Object) null); // 调用 JS 的 init 方法
             } catch (Exception ex) {
-                log.error("Error on script（事件脚本初始化出错）: {}", entry.em.getName(), ex); // 记录错误日志
+                log.error(I18nUtil.getLogMessage("EventScriptManager.init.error1"), entry.em.getName(), ex); // 记录错误日志
             }
         }
 
@@ -174,5 +176,9 @@ public class EventScriptManager extends AbstractScriptManager {
         for (EventEntry entry : eventEntries) {
             entry.em.cancel(); // 取消所有事件
         }
+    }
+
+    public List<EventManager> getEventManagers() {
+        return events.values().stream().map(entry -> entry.em).toList();
     }
 }

@@ -739,13 +739,13 @@ public abstract class AbstractDealDamageHandler extends AbstractPacketHandler {
         long calcDmgMax;
 
         if (magic && ret.skill != 0) {   // thanks onechord for noticing a few false positives stemming from maxdmg as 0
-            calcDmgMax = (long) (Math.ceil((chr.getTotalMagic() * Math.ceil(chr.getTotalMagic() / 1000.0) + chr.getTotalMagic()) / 30.0) + Math.ceil(chr.getTotalInt() / 200.0));
+            calcDmgMax = (long) (((chr.getTotalMagic() * (chr.getTotalMagic() / 1000.0) + chr.getTotalMagic()) / 30.0) + (chr.getTotalInt() / 200.0));
         } else if (ret.skill == Rogue.LUCKY_SEVEN || ret.skill == NightWalker.LUCKY_SEVEN || ret.skill == NightLord.TRIPLE_THROW) {
-            calcDmgMax = (long) ((chr.getTotalLuk() * 5) * Math.ceil(chr.getTotalWatk() / 100.0));
+            calcDmgMax = (long) ((chr.getTotalLuk() * 5) * (chr.getTotalWatk() / 100.0));
         } else if (ret.skill == DragonKnight.DRAGON_ROAR) {
-            calcDmgMax = (long) ((chr.getTotalStr() * 4 + chr.getTotalDex()) * Math.ceil(chr.getTotalWatk() / 100.0));
+            calcDmgMax = (long) ((chr.getTotalStr() * 4 + chr.getTotalDex()) * (chr.getTotalWatk() / 100.0));
         } else if (ret.skill == NightLord.VENOMOUS_STAR || ret.skill == Shadower.VENOMOUS_STAB) {
-            calcDmgMax = (long) (Math.ceil((18.5 * (chr.getTotalStr() + chr.getTotalLuk()) + chr.getTotalDex() * 2) / 100.0) * chr.calculateMaxBaseDamage(chr.getTotalWatk()));
+            calcDmgMax = (long) (((18.5 * (chr.getTotalStr() + chr.getTotalLuk()) + chr.getTotalDex() * 2) / 100.0) * chr.calculateMaxBaseDamage(chr.getTotalWatk()));
         } else {
             calcDmgMax = chr.calculateMaxBaseDamage(chr.getTotalWatk());
         }
@@ -1346,7 +1346,7 @@ public abstract class AbstractDealDamageHandler extends AbstractPacketHandler {
                 return;
             case BURST:
                 AutobanFactory.ATTACK_INTERVAL.alert(chr, reason);
-                break;
+                return;   // 爆发由对应检测项告警；禁止 fall-through 到全局层重复计分
             case PASS:
                 return;
         }

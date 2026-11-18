@@ -43,7 +43,7 @@ public final class HealOvertimeHandler extends AbstractPacketHandler {
         }
 
         AutobanManager abm = chr.getAutoBanManager();
-        int timestamp = Server.getInstance().getCurrentTimestamp();
+        long timestamp = Server.getInstance().getCurrentTimestamp();
         p.skip(8);
 
         short healHP = p.readShort();
@@ -69,6 +69,7 @@ public final class HealOvertimeHandler extends AbstractPacketHandler {
             abm.setTimestamp(9, timestamp, 28);
             if ((abm.getLastSpam(1) + 1500) > timestamp) {
                 AutobanFactory.FAST_MP_HEALING.addPoint(abm, "Fast mp healing");
+                abm.spam(1, timestamp);   // 命中后也刷新，避免"一次误判 → 永久误判"的自我放大
                 return;     // thanks resinate for noticing mp being gained even after detection
             }
             healMP = applyImprovedMpRecovery(chr, healMP);

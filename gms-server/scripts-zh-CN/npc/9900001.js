@@ -1,11 +1,5 @@
 /*
     BeiDou Script Center - Clean & Stable v083 Layout (Optimized Style, 3 Columns)
-
-    合并说明（2026-11-18 同步上游 c273a82）：
-    - 保留本地三列布局与资产显示
-    - 新增玩家入口：野外BOSS刷新（上游 AreaBossRefresh.js）
-    - GM 区补充：UI查询 / 一键删除道具 / 一键刷道具（上游对应脚本均存在）
-    - 未合入：快速转职 / 技能学习 / 转世重生 / 测试脚本（仓库内无对应脚本，合入即为死链）
 */
 
 var icon = "#fUI/UIWindow.img/QuestIcon/3/0#"; // 使用稳定的图标路径
@@ -46,7 +40,6 @@ function action(mode, type, selection) {
         // 主要功能区 (三列布局)
         selStr += "#L0# #b新人福利#k#l #L1# #b每日签到#k#l #L2# #b在线奖励#k#l\r\n";
         selStr += "#L3# #b传送中心#k#l #L4# #b爆率查询#k#l #L5# #b任务排行#k#l\r\n";
-        selStr += "#L7# #b野外BOSS刷新#k#l\r\n";
 
         // 70级专属进阶区
         if (p.getLevel() >= 70) {
@@ -58,7 +51,6 @@ function action(mode, type, selection) {
         if (p.isGM()) {
             selStr += "\r\n#d━━━━━━━━━━━━━━━━━#k#e#r[ GM 后台 ]#k#n#d━━━━━━━━━━━━━━━━━#k\r\n";
             selStr += "#L61#超级传送#l #L62#超级商店#l #L63#整容集合#l\r\n";
-            selStr += "#L64#UI查询#l #L65#一键删除道具#l #L66#一键刷道具#l\r\n";
         }
 
         cm.sendSimple(selStr);
@@ -76,13 +68,9 @@ function action(mode, type, selection) {
             case 4: cm.dispose(); cm.openNpc(9900001, "当前地图掉落"); break;
             case 5: cm.dispose(); cm.openNpc(9900001, "任务排行"); break;
             case 6: cm.dispose(); cm.openNpc(9900001, "一键删除道具small"); break;
-            case 7: cm.dispose(); cm.openNpc(9900001, "AreaBossRefresh"); break;
             case 61: cm.dispose(); cm.openNpc(9900001, "万能传送"); break;
             case 62: cm.dispose(); cm.openShopNPC(9900001); break;
             case 63: cm.dispose(); cm.openNpc(9900001, "Salon"); break;
-            case 64: cm.dispose(); cm.openNpc(9900001, "UI查询"); break;
-            case 65: cm.dispose(); cm.openNpc(9900001, "一键删除道具"); break;
-            case 66: cm.dispose(); cm.openNpc(9900001, "一键刷道具"); break;
             default: cm.dispose();
         }
     }

@@ -193,10 +193,12 @@ public class Server {
         this.lgnWLock = loginLock.writeLock();
     }
 
-    public int getCurrentTimestamp() {
+    public long getCurrentTimestamp() {
         // 使用单调时钟分桶，保留毫秒单位供恢复处理器计算间隔。
+        // 返回 long：运行满 2^31 ms（约 24 天 20 小时）后 int 会溢出为负，
+        // 使 getLastSpam 的时间差比较失真，导致 Fast HP/MP Healing 误封正常玩家
         long elapsedMillis = NANOSECONDS.toMillis(System.nanoTime() - SPAM_CLOCK_ORIGIN_NANOS);
-        return (int) (elapsedMillis - elapsedMillis % spamWindowMillis);
+        return elapsedMillis - elapsedMillis % spamWindowMillis;
     }
 
     public long getCurrentTime() {  // returns a slightly delayed time value, under frequency of UPDATE_INTERVAL

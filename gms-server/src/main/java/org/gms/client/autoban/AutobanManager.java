@@ -27,7 +27,7 @@ public class AutobanManager {
     private int lastmisses = 0;
     private int samemisscount = 0;
     private final long[] spam = new long[20];
-    private final int[] timestamp = new int[20];
+    private final long[] timestamp = new long[20];
     private final byte[] timestampcounter = new byte[20];
 
 
@@ -99,7 +99,7 @@ public class AutobanManager {
         this.spam[type] = Server.getInstance().getCurrentTime();
     }
 
-    public void spam(int type, int timestamp) {
+    public void spam(int type, long timestamp) {
         this.spam[type] = timestamp;
     }
 
@@ -124,7 +124,7 @@ public class AutobanManager {
      * @param type type
      * @return Timestamp checker
      */
-    public void setTimestamp(int type, int time, int times) {
+    public void setTimestamp(int type, long time, int times) {
         if (this.timestamp[type] == time) {
             this.timestampcounter[type]++;
             if (this.timestampcounter[type] >= times) {

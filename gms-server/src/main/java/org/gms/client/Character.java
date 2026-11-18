@@ -10235,8 +10235,8 @@ public class Character extends AbstractCharacterObject {
     public static final double STABLE_CV = 0.3;
     /** 网络抖动透明上限：< 此值的间隔不更新状态、不入窗口 */
     public static final long MIN_INTERVAL = 50;
-    /** 平均阈值：窗口 avg >= 此值判定为正常频率 */
-    public static final long NORMAL_AVG = 250;
+    /** 平均阈值：窗口 avg >= 此值判定为正常频率。取 200ms：弓系/弩系配 Booster 的合法攻速下限约 200ms */
+    public static final long NORMAL_AVG = 200;
     /** 窗口自动过期时间：60s 无写入自动重置 */
     private static final long CLEANUP_MS = 60_000;
 
